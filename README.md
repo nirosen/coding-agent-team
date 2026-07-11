@@ -19,16 +19,27 @@ Local Cursor SDK multi-agent team for VPN/SSH remotes: one **Opus master** spawn
 
 ## Remote server setup (no secret copy-paste)
 
-On each VPN/SSH host:
+On each VPN/SSH host — **clone once, then one script**:
 
 ```bash
 git clone https://github.com/nirosen/coding-agent-team.git
 cd coding-agent-team
-cp .env.example .env
-# edit .env locally on the host — never commit it
-npm install
-export $(grep -v '^#' .env | xargs)   # or use your secret manager
-npm run team -- --cwd /path/to/your/repo --task "..."
+chmod +x scripts/*.sh
+./scripts/bootstrap.sh
+```
+
+First run creates `.env` from `.env.example` and exits. Edit `.env` on the host (`CURSOR_API_KEY`, optional Slack), then:
+
+```bash
+./scripts/bootstrap.sh
+source scripts/load-env.sh
+npm run team -- --cwd /path/to/your/repo --task "Your task"
+```
+
+Or bootstrap + run in one go (after `.env` is filled):
+
+```bash
+./scripts/run-team.sh --cwd /path/to/your/repo --task "Your task"
 ```
 
 **Secrets stay on the host only** (`.env` is gitignored). This repo has placeholders in `.env.example` only.
