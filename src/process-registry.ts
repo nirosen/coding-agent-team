@@ -76,6 +76,7 @@ export type ExecutionReceipt = {
   ownerJobId: string;
   commandId: string;
   commandSha256: string;
+  startedWorkspaceSha256: string;
   workspaceSha256: string;
   phase: string;
   kind: ManifestCommand["kind"];
@@ -110,6 +111,7 @@ type Tracked = {
   settle: Promise<ProcessRecord>;
   resolve: (record: ProcessRecord) => void;
   timedOut: boolean;
+  startedWorkspaceSha256: string;
 };
 
 function delay(ms: number): Promise<void> {
@@ -513,6 +515,7 @@ export class ProcessRegistry {
     env.CODING_AGENT_TEAM_RUN_ID = this.teamRunId;
     env.CODING_AGENT_COMMAND_ID = command.id;
 
+    const startedWorkspaceSha256 = workspaceSnapshotSha256(this.workspace);
     const processId = `process-${crypto.randomUUID()}`;
     const logDirectory = safeLogDirectory(this.stateDirectory, this.teamRunId);
     const logPath = path.join(logDirectory, `${processId}.log`);
@@ -597,6 +600,7 @@ export class ProcessRegistry {
       settle,
       resolve,
       timedOut: false,
+      startedWorkspaceSha256,
     };
     this.tracked.set(processId, tracked);
     this.publish(tracked, "starting");
@@ -717,19 +721,28 @@ export class ProcessRegistry {
       }
     }
     const endedAt = Date.now();
-    tracked.record = {
-      ...tracked.record,
-      status,
-      exitCode: code ?? undefined,
-      signal: signal ?? undefined,
-      endedAt,
-      updatedAt: endedAt,
-    };
     try {
-      this.onProcess(structuredClone(tracked.record));
       const expectedExit =
         code !== null && tracked.command.expectedExitCodes.includes(code);
       const workspaceSha256 = workspaceSnapshotSha256(this.workspace);
+      const workspaceStable =
+        (tracked.command.kind !== "test" &&
+          tracked.command.kind !== "review") ||
+        tracked.startedWorkspaceSha256 === workspaceSha256;
+      tracked.record = {
+        ...tracked.record,
+        status:
+          status === "exited" && expectedExit && !workspaceStable
+            ? "failed"
+            : status,
+        exitCode: code ?? undefined,
+        signal: signal ?? undefined,
+        endedAt,
+        updatedAt: endedAt,
+        lastError: workspaceStable
+          ? tracked.record.lastError
+          : "workspace changed while test/review command was running",
+      };
       this.onReceipt({
         schema: "coding-agent-team-execution-receipt/v1",
         receiptId: receiptId(tracked.command.id),
@@ -737,6 +750,7 @@ export class ProcessRegistry {
         ownerJobId: tracked.record.ownerJobId,
         commandId: tracked.command.id,
         commandSha256: tracked.record.commandSha256,
+        startedWorkspaceSha256: tracked.startedWorkspaceSha256,
         workspaceSha256,
         phase: tracked.command.phase,
         kind: tracked.command.kind,
@@ -745,8 +759,14 @@ export class ProcessRegistry {
         exitCode: code,
         signal,
         expectedExit,
-        status: status === "exited" && expectedExit ? "passed" : "failed",
+        status:
+          tracked.record.status === "exited" && expectedExit
+            ? "passed"
+            : "failed",
       });
+      // Keep the durable process record active until its completion receipt
+      // and post-command workspace digest have both been persisted.
+      this.onProcess(structuredClone(tracked.record));
       tracked.resolve(structuredClone(tracked.record));
     } catch (error) {
       const failure =

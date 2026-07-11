@@ -5,6 +5,8 @@ import path from "node:path";
 const workspace = process.argv[2]
   ? fs.realpathSync(path.resolve(process.argv[2]))
   : null;
+const statePath = process.argv[3] ? path.resolve(process.argv[3]) : null;
+const teamRunId = process.argv[4] ?? null;
 const deny = (message) => {
   process.stdout.write(
     JSON.stringify({
@@ -32,6 +34,42 @@ try {
 if (!workspace) {
   deny("Hard-policy workspace binding is unavailable.");
   process.exit(0);
+}
+
+const toolName = input.tool_name ?? input.toolName ?? input.tool;
+if (toolName !== "supervised_process") {
+  try {
+    if (!statePath || !teamRunId) {
+      throw new Error("state binding is unavailable");
+    }
+    const info = fs.lstatSync(statePath);
+    if (
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      info.size > 10 * 1024 * 1024
+    ) {
+      throw new Error("state file is not trusted");
+    }
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    if (state.teamRunId !== teamRunId || state.cwd !== workspace) {
+      throw new Error("state file does not match the active run");
+    }
+    const active = Object.values(state.processes ?? {}).some(
+      (record) =>
+        record &&
+        record.endedAt === undefined &&
+        ["starting", "running", "stopping"].includes(record.status),
+    );
+    if (active) {
+      deny(
+        "Workspace tools are frozen while supervised work is active; wait for or stop it first.",
+      );
+      process.exit(0);
+    }
+  } catch {
+    deny("Hard-policy process state could not be verified.");
+    process.exit(0);
+  }
 }
 
 const protectedCursor = path.join(workspace, ".cursor");

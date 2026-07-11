@@ -133,13 +133,17 @@ export function installDenyShellProjectHook(opts: {
     );
   }
   const protectScriptSha256 = sha256(safeRead(protectScript));
+  const statePath = path.join(
+    opts.stateDirectory,
+    `${opts.teamRunId}.json`,
+  );
   const manifest = {
     version: 1,
     hooks: {
       preToolUse: [
         {
           type: "command",
-          command: `${shellQuote(process.execPath)} ${shellQuote(protectScript)} ${shellQuote(workspace)}`,
+          command: `${shellQuote(process.execPath)} ${shellQuote(protectScript)} ${shellQuote(workspace)} ${shellQuote(statePath)} ${shellQuote(opts.teamRunId)}`,
           timeout: 5,
           failClosed: true,
         },

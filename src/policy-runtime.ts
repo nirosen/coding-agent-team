@@ -355,7 +355,8 @@ export class PolicyRuntime {
       }
       if (
         (command.kind === "test" || command.kind === "review") &&
-        receipt.workspaceSha256 !== workspaceSha256
+        (receipt.startedWorkspaceSha256 !== receipt.workspaceSha256 ||
+          receipt.workspaceSha256 !== workspaceSha256)
       ) {
         throw new Error(
           `workspace changed after ${command.kind} receipt: ${receipt.receiptId}`,
@@ -481,6 +482,7 @@ export class PolicyRuntime {
             receiptId: receipt.receiptId,
             commandId: receipt.commandId,
             commandSha256: receipt.commandSha256,
+            startedWorkspaceSha256: receipt.startedWorkspaceSha256,
             workspaceSha256: receipt.workspaceSha256,
             status: receipt.status,
           }))

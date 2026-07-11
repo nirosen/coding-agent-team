@@ -107,6 +107,8 @@ During the run:
 - `supervised_process` accepts command IDs only from the signed manifest, uses
   exact argv without a shell, and contains local descendants in a per-command
   PID namespace;
+- project tools are frozen while supervised work is active, and test/review
+  receipts fail if their start and end working-tree digests differ;
 - the harness refuses job/run completion while registered work is active;
 - every phase transition rechecks receipts, frozen test selection, process
   idleness, source hashes, canonical spend events, watermarks, limits, and a

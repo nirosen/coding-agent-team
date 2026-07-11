@@ -17,6 +17,17 @@ describe("hard-policy project hook", () => {
       stateDirectory: state,
       teamRunId: "team-hook-test",
     });
+    const statePath = path.join(state, "team-hook-test.json");
+    const writeState = (processes: Record<string, unknown>): void =>
+      fs.writeFileSync(
+        statePath,
+        JSON.stringify({
+          teamRunId: "team-hook-test",
+          cwd: fs.realpathSync(workspace),
+          processes,
+        }),
+      );
+    writeState({});
     lease.verify();
     const manifest = JSON.parse(fs.readFileSync(lease.hookPath, "utf8"));
     assert.equal(
@@ -41,6 +52,8 @@ describe("hard-policy project hook", () => {
       [
         path.join(root, "scripts", "protect-policy-files.mjs"),
         workspace,
+        statePath,
+        "team-hook-test",
       ],
       {
         input: JSON.stringify({
@@ -59,6 +72,8 @@ describe("hard-policy project hook", () => {
       [
         path.join(root, "scripts", "protect-policy-files.mjs"),
         workspace,
+        statePath,
+        "team-hook-test",
       ],
       {
         input: JSON.stringify({
@@ -71,6 +86,28 @@ describe("hard-policy project hook", () => {
     );
     assert.equal(JSON.parse(aliasOutput).permission, "deny");
     fs.unlinkSync(stateAlias);
+    writeState({
+      active: { status: "running", endedAt: undefined },
+    });
+    const frozenOutput = execFileSync(
+      process.execPath,
+      [
+        path.join(root, "scripts", "protect-policy-files.mjs"),
+        workspace,
+        statePath,
+        "team-hook-test",
+      ],
+      {
+        input: JSON.stringify({
+          hook_event_name: "preToolUse",
+          tool_name: "Write",
+          tool_input: { path: path.join(workspace, "source.ts") },
+        }),
+        encoding: "utf8",
+      },
+    );
+    assert.equal(JSON.parse(frozenOutput).permission, "deny");
+    writeState({});
     const mcpPath = path.join(workspace, ".cursor", "mcp.json");
     fs.writeFileSync(mcpPath, '{"mcpServers":{}}\n');
     assert.throws(() => lease.verify(), /MCP\/plugin settings/);

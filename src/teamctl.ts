@@ -1187,6 +1187,7 @@ function verifyLatestRun(
       receipt.phase !== command.phase ||
       receipt.kind !== command.kind ||
       receipt.commandSha256 !== commandDigest(command) ||
+      !/^[0-9a-f]{64}$/.test(receipt.startedWorkspaceSha256) ||
       !/^[0-9a-f]{64}$/.test(receipt.workspaceSha256) ||
       processRecord.commandId !== receipt.commandId ||
       processRecord.commandSha256 !== receipt.commandSha256 ||
@@ -1352,7 +1353,8 @@ function verifyLatestRun(
       const command = commandById.get(receipt.commandId);
       if (
         (command?.kind === "test" || command?.kind === "review") &&
-        receipt.workspaceSha256 !== gate.workspaceSha256
+        (receipt.startedWorkspaceSha256 !== receipt.workspaceSha256 ||
+          receipt.workspaceSha256 !== gate.workspaceSha256)
       ) {
         throw new Error(
           `workspace changed after ${command.kind} receipt: ${receipt.receiptId}`,
@@ -1364,6 +1366,7 @@ function verifyLatestRun(
         receiptId: receipt.receiptId,
         commandId: receipt.commandId,
         commandSha256: receipt.commandSha256,
+        startedWorkspaceSha256: receipt.startedWorkspaceSha256,
         workspaceSha256: receipt.workspaceSha256,
         status: receipt.status,
       }))
@@ -1415,6 +1418,7 @@ function verifyLatestRun(
       authorization.id !== gate.authorizationId ||
       authorization.teamRunId !== state.teamRunId ||
       authorization.decision !== "approve" ||
+      authorization.value !== undefined ||
       authorization.questionSha256 !== questionSha256(gate.question) ||
       !verifyControlEnvelope(authorization, keys.publicKey)
     ) {
@@ -1440,6 +1444,7 @@ function verifyLatestRun(
     !finalGate ||
     !finalAuthorization ||
     finalAuthorization.id !== seal.finalAuthorizationId ||
+    finalAuthorization.value !== undefined ||
     finalGate.workspaceSha256 !== seal.workspaceSha256 ||
     seal.workspaceSha256 !== payload.workspaceSha256 ||
     artifactSha256(finalAuthorization) !==

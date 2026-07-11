@@ -69,6 +69,21 @@ describe("supervised process identity", () => {
             expectedExitCodes: [7],
           },
           {
+            id: "mutating-test",
+            phase: "execution",
+            kind: "test",
+            argv: [
+              process.execPath,
+              "-e",
+              "require('node:fs').writeFileSync('test-output.tmp','changed')",
+            ],
+            cwd: ".",
+            timeoutMs: 10_000,
+            envAllowlist: [],
+            executableSha256: sha256(fs.readFileSync(process.execPath)),
+            expectedExitCodes: [0],
+          },
+          {
             id: "escape-group",
             phase: "execution",
             kind: "command",
@@ -115,10 +130,16 @@ describe("supervised process identity", () => {
         false,
       );
 
+      const mutating = await registry.start("master-1", "mutating-test");
+      const mutatingResult = await registry.wait(mutating.processId);
+      assert.equal(mutatingResult.status, "failed");
+      assert.equal(receipts[1]?.status, "failed");
+      fs.unlinkSync(path.join(workspace, "test-output.tmp"));
+
       const escaped = await registry.start("master-1", "escape-group");
       const escapedResult = await registry.wait(escaped.processId);
       assert.equal(escapedResult.status, "exited");
-      assert.equal(receipts[1]?.status, "passed");
+      assert.equal(receipts[2]?.status, "passed");
       await new Promise((resolve) => setTimeout(resolve, 750));
       assert.equal(
         fs.existsSync(path.join(workspace, "escaped.marker")),
