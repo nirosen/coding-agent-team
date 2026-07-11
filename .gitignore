@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+.team-state/
+.DS_Store
+*.pem
+*credentials*
+*secret*
