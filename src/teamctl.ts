@@ -20,6 +20,7 @@ import {
   questionSha256,
   redactSecrets,
   signControlEnvelope,
+  validateControlEnvelope,
   type AuthorizationDecision,
   type ControlCapability,
   type UnsignedControlEnvelope,
@@ -29,6 +30,31 @@ import {
   acknowledgeControl,
 } from "./control.js";
 import type { TeamStateFile } from "./state.js";
+import {
+  RUN_BINDING_SCHEMA,
+  artifactSha256,
+  canonicalJson,
+  sha256,
+  signRunBinding,
+  validatePolicyProfile,
+  validateRunBinding,
+  verifyRunBinding,
+  type UnsignedRunBinding,
+} from "./policy.js";
+import {
+  commandDigest,
+  validateCommandManifest,
+  validateTestManifest,
+} from "./manifests.js";
+import {
+  RECONCILIATION_SCHEMA,
+  validateAccountingConfig,
+  type SpendReconciliation,
+} from "./accounting.js";
+import {
+  readinessSealSha256,
+  verifyReadinessSeal,
+} from "./policy-runtime.js";
 
 type ControllerConfig = {
   worker_host: string;
@@ -41,6 +67,7 @@ type ControllerConfig = {
   public_key_path: string;
   minimum_free_gb?: number;
   require_docker?: boolean;
+  require_policy_bundle?: boolean;
 };
 
 type RemoteStatus = {
@@ -60,9 +87,10 @@ Commands:
   self-test                      Verify signing/spool locally; no SSH
   status                         Print active worker/capability/state JSON
   tail                           Capture recent harness tmux output
-  start <task-file>              Start a new signed-control harness run
+  start <task-file|bundle-dir>   Start a legacy task or signed hard-policy run
   steer <text...>                Queue signed run-scoped guidance
   authorize <decision>           Sign exact pending HITL gate
+  verify                         Verify the latest terminal readiness seal
 
 Decisions:
   approve | approve:<scope> | approve-<scope> | deny | cancel | choice:<value>
@@ -126,6 +154,12 @@ function loadConfig(configPath: string): {
   ) {
     throw new Error("minimum_free_gb is invalid");
   }
+  if (
+    config.require_policy_bundle !== undefined &&
+    typeof config.require_policy_bundle !== "boolean"
+  ) {
+    throw new Error("require_policy_bundle must be boolean");
+  }
   return { config, configDir: path.dirname(configPath) };
 }
 
@@ -180,7 +214,7 @@ function remotePython(
 const STATUS_CODE = String.raw`
 import json,os,pathlib,subprocess,sys
 root=pathlib.Path(sys.argv[1]).expanduser().resolve()
-cwd=sys.argv[2]
+cwd=str(pathlib.Path(sys.argv[2]).resolve())
 session=sys.argv[3]
 def process_alive(pid):
   if pid<=0: return False
@@ -204,13 +238,30 @@ if root.is_dir():
 active.sort(reverse=True,key=lambda item:item[0])
 cap=active[0][1] if active else None
 state=None
-if cap:
-  state_path=pathlib.Path(cap["stateFile"])
-  expected=(pathlib.Path(cwd)/".team-state").resolve()
-  if state_path.is_file() and not state_path.is_symlink() and state_path.stat().st_size<=10485760 and state_path.resolve().parent==expected:
+expected=(pathlib.Path(cwd)/".team-state").resolve()
+state_candidates=[]
+if cap: state_candidates.append(pathlib.Path(cap["stateFile"]))
+if expected.is_dir() and not expected.is_symlink():
+  state_candidates.extend(expected.glob("team-*.json"))
+seen=set()
+valid=[]
+for state_path in state_candidates:
+  try:
+    resolved=state_path.resolve()
+    if resolved in seen or resolved.parent!=expected: continue
+    seen.add(resolved)
+    if not state_path.is_file() or state_path.is_symlink() or state_path.stat().st_size>10485760: continue
     candidate=json.loads(state_path.read_text())
-    if candidate.get("teamRunId")==cap.get("teamRunId") and candidate.get("cwd")==cwd:
-      state=candidate
+    if candidate.get("cwd")!=cwd: continue
+    if cap and candidate.get("teamRunId")==cap.get("teamRunId"):
+      valid.append((2,int(candidate.get("updatedAt",0)),candidate))
+    else:
+      valid.append((1,int(candidate.get("updatedAt",0)),candidate))
+  except Exception:
+    pass
+if valid:
+  valid.sort(reverse=True,key=lambda item:(item[0],item[1]))
+  state=valid[0][2]
 tmux=subprocess.run(["tmux","has-session","-t",session],capture_output=True).returncode==0
 pane_dead=False
 if tmux:
@@ -371,6 +422,25 @@ function selfTest(): void {
   if (!verifyControlEnvelope(envelope, keys.publicKeyPem)) {
     throw new Error("self-test signature verification failed");
   }
+  const binding = signRunBinding(
+    {
+      schema: RUN_BINDING_SCHEMA,
+      teamRunId: "team-self-test",
+      createdAt: now,
+      expiresAt: now + 60_000,
+      issuer: "teamctl-self-test",
+      taskSha256: "0".repeat(64),
+      profileSha256: "1".repeat(64),
+      commandManifestSha256: "2".repeat(64),
+      testManifestSha256: "3".repeat(64),
+      accountingConfigSha256: "4".repeat(64),
+      workspace: { cwd: os.tmpdir(), gitHead: null },
+    },
+    keys.privateKeyPem,
+  );
+  if (!verifyRunBinding(binding, keys.publicKeyPem)) {
+    throw new Error("self-test run-binding verification failed");
+  }
   const controlDir = fs.mkdtempSync(
     path.join(os.tmpdir(), "teamctl-self-test-"),
   );
@@ -387,7 +457,9 @@ function selfTest(): void {
   } finally {
     fs.rmSync(controlDir, { recursive: true, force: true });
   }
-  console.log("teamctl self-test: PASS (Ed25519 + durable spool; no SSH)");
+  console.log(
+    "teamctl self-test: PASS (Ed25519 controls + run binding + durable spool; no SSH)",
+  );
 }
 
 function readControllerKeys(
@@ -415,18 +487,157 @@ function readControllerKeys(
   };
 }
 
+const WORKSPACE_IDENTITY_CODE = String.raw`
+import json,pathlib,subprocess,sys
+cwd=pathlib.Path(sys.argv[1]).resolve()
+if not cwd.is_dir(): raise SystemExit(f"team cwd not found: {cwd}")
+git=subprocess.run(["git","rev-parse","--verify","HEAD"],cwd=cwd,text=True,capture_output=True,timeout=10)
+if git.returncode!=0: raise SystemExit("hard-policy workspace requires a Git HEAD")
+head=git.stdout.strip()
+if len(head)<40 or any(ch not in "0123456789abcdef" for ch in head):
+  raise SystemExit("workspace git HEAD is invalid")
+print(json.dumps({"cwd":str(cwd),"gitHead":head}))
+`;
+
+function remoteWorkspaceIdentity(config: ControllerConfig): {
+  cwd: string;
+  gitHead: string | null;
+} {
+  return JSON.parse(
+    remotePython(config, WORKSPACE_IDENTITY_CODE, [config.team_cwd], {
+      capture: true,
+    }),
+  ) as { cwd: string; gitHead: string | null };
+}
+
+function readBundleArtifact(
+  directory: string,
+  name: string,
+  maximumBytes = 4 * 1024 * 1024,
+): Buffer {
+  const filePath = path.join(directory, name);
+  const before = fs.lstatSync(filePath);
+  if (
+    !before.isFile() ||
+    before.isSymbolicLink() ||
+    before.size > maximumBytes
+  ) {
+    throw new Error(`${name} must be a regular non-symlink file`);
+  }
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(
+      filePath,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0),
+    );
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.ino !== before.ino) {
+      throw new Error(`${name} changed while opening`);
+    }
+    return fs.readFileSync(fd);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+type ControllerStartPayload =
+  | { mode: "task"; task: string }
+  | {
+      mode: "bundle";
+      teamRunId: string;
+      files: Record<string, string>;
+    };
+
+function buildBundlePayload(
+  config: ControllerConfig,
+  configDir: string,
+  bundlePath: string,
+): ControllerStartPayload {
+  const directory = fs.realpathSync(bundlePath);
+  const info = fs.lstatSync(directory);
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error("run bundle must be a real directory");
+  }
+  const taskBytes = readBundleArtifact(directory, "task.md", 1024 * 1024);
+  if (!taskBytes.toString("utf8").trim()) {
+    throw new Error("run bundle task.md is empty");
+  }
+  const profile = validatePolicyProfile(
+    JSON.parse(readBundleArtifact(directory, "profile.json").toString("utf8")),
+  );
+  const commands = validateCommandManifest(
+    JSON.parse(readBundleArtifact(directory, "commands.json").toString("utf8")),
+  );
+  const tests = validateTestManifest(
+    JSON.parse(readBundleArtifact(directory, "tests.json").toString("utf8")),
+    commands,
+  );
+  const accounting = validateAccountingConfig(
+    JSON.parse(
+      readBundleArtifact(directory, "accounting.json").toString("utf8"),
+    ),
+  );
+  for (const command of commands.commands) {
+    if (!profile.phases.includes(command.phase)) {
+      throw new Error(
+        `command ${command.id} references unknown phase ${command.phase}`,
+      );
+    }
+  }
+  const keys = readControllerKeys(config, configDir);
+  const workspace = remoteWorkspaceIdentity(config);
+  const now = Date.now();
+  const teamRunId = `team-${now}-${crypto.randomUUID()}`;
+  const unsigned: UnsignedRunBinding = {
+    schema: RUN_BINDING_SCHEMA,
+    teamRunId,
+    createdAt: now,
+    expiresAt: now + 60 * 60 * 1000,
+    issuer: "mec04-codex-controller",
+    taskSha256: sha256(taskBytes),
+    profileSha256: artifactSha256(profile),
+    commandManifestSha256: artifactSha256(commands),
+    testManifestSha256: artifactSha256(tests),
+    accountingConfigSha256: artifactSha256(accounting),
+    workspace,
+  };
+  const binding = signRunBinding(unsigned, keys.privateKey);
+  return {
+    mode: "bundle",
+    teamRunId,
+    files: {
+      "task.md": taskBytes.toString("base64"),
+      "profile.json": Buffer.from(`${canonicalJson(profile)}\n`).toString(
+        "base64",
+      ),
+      "commands.json": Buffer.from(`${canonicalJson(commands)}\n`).toString(
+        "base64",
+      ),
+      "tests.json": Buffer.from(`${canonicalJson(tests)}\n`).toString("base64"),
+      "accounting.json": Buffer.from(
+        `${canonicalJson(accounting)}\n`,
+      ).toString("base64"),
+      "binding.json": Buffer.from(`${canonicalJson(binding)}\n`).toString(
+        "base64",
+      ),
+    },
+  };
+}
+
 const START_CODE = String.raw`
 import base64,json,os,pathlib,socket,subprocess,sys,time,uuid
-team=pathlib.Path(sys.argv[1])
-harness=pathlib.Path(sys.argv[2])
+team=pathlib.Path(sys.argv[1]).resolve()
+harness=pathlib.Path(sys.argv[2]).resolve()
 session=sys.argv[3]
-task=base64.b64decode(sys.stdin.read())
+payload=json.loads(base64.b64decode(sys.stdin.read()))
 public_key=pathlib.Path(sys.argv[4]).expanduser()
 min_gb=sys.argv[5]
 require_docker=sys.argv[6]=="1"
 control_root=pathlib.Path(sys.argv[7]).expanduser().resolve()
 public_key_bytes=base64.b64decode(sys.argv[8])
 expected_fingerprint=sys.argv[9]
+if payload.get("mode") not in ("task","bundle"): raise SystemExit("invalid start payload mode")
+expected_run=payload.get("teamRunId","") if payload.get("mode")=="bundle" else ""
 def process_alive(pid):
   if pid<=0: return False
   try: os.kill(pid,0); return True
@@ -486,18 +697,43 @@ else:
   key_dir_fd=os.open(public_key.parent,os.O_RDONLY)
   try: os.fsync(key_dir_fd)
   finally: os.close(key_dir_fd)
-tasks=pathlib.Path.home()/".coding-agent-team"/"tasks"
-tasks.mkdir(parents=True,exist_ok=True,mode=0o700)
-task_file=tasks/f"task-{int(time.time()*1000)}-{uuid.uuid4().hex}.md"
-tmp=task_file.with_suffix(".tmp")
-with tmp.open("xb") as handle:
-  handle.write(task); handle.flush(); os.fsync(handle.fileno())
-os.chmod(tmp,0o600)
-os.replace(tmp,task_file)
-task_dir_fd=os.open(tasks,os.O_RDONLY)
-try: os.fsync(task_dir_fd)
-finally: os.close(task_dir_fd)
-args=["npm","run","team","--","--cwd",str(team),"--task-file",str(task_file),
+storage=pathlib.Path.home()/".coding-agent-team"
+storage.mkdir(parents=True,exist_ok=True,mode=0o700)
+os.chmod(storage,0o700)
+launch_flag=""
+launch_path=None
+if payload["mode"]=="task":
+  task=base64.b64decode(payload["task"])
+  if not task.strip() or len(task)>1048576: raise SystemExit("legacy task is empty or too large")
+  tasks=storage/"tasks"
+  tasks.mkdir(parents=True,exist_ok=True,mode=0o700)
+  launch_path=tasks/f"task-{int(time.time()*1000)}-{uuid.uuid4().hex}.md"
+  launch_flag="--task-file"
+  files={launch_path:task}
+else:
+  if not isinstance(expected_run,str) or not expected_run.startswith("team-") or len(expected_run)>256:
+    raise SystemExit("invalid bundle teamRunId")
+  allowed={"task.md","profile.json","commands.json","tests.json","accounting.json","binding.json"}
+  encoded=payload.get("files")
+  if not isinstance(encoded,dict) or set(encoded)!=allowed: raise SystemExit("invalid bundle file set")
+  bundles=storage/"bundles"
+  bundles.mkdir(parents=True,exist_ok=True,mode=0o700)
+  launch_path=bundles/expected_run
+  launch_path.mkdir(mode=0o700)
+  launch_flag="--run-bundle"
+  files={launch_path/name:base64.b64decode(encoded[name]) for name in allowed}
+  if any(len(data)>4194304 for data in files.values()): raise SystemExit("bundle file too large")
+for destination,data in files.items():
+  tmp=destination.with_name(destination.name+f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
+  with tmp.open("xb") as handle:
+    handle.write(data); handle.flush(); os.fsync(handle.fileno())
+  os.chmod(tmp,0o600)
+  os.replace(tmp,destination)
+for directory in {destination.parent for destination in files}:
+  directory_fd=os.open(directory,os.O_RDONLY)
+  try: os.fsync(directory_fd)
+  finally: os.close(directory_fd)
+args=["npm","run","team","--","--cwd",str(team),launch_flag,str(launch_path),
       "--steer","--controller-public-key",str(public_key),
       "--min-free-gb",min_gb,"--verbose"]
 if require_docker: args.append("--require-docker")
@@ -514,8 +750,9 @@ for _ in range(120):
       if (cap.get("active") and cap.get("cwd")==str(team)
           and cap.get("publicKeyFingerprint")==expected_fingerprint
           and int(cap.get("startedAt",0))>=launch_started
+          and (not expected_run or cap.get("teamRunId")==expected_run)
           and process_alive(pid)):
-        print(f"started tmux={session} run={cap.get('teamRunId')} task={task_file}")
+        print(f"started tmux={session} run={cap.get('teamRunId')} input={launch_path}")
         raise SystemExit(0)
     except (json.JSONDecodeError,ValueError,TypeError):
       pass
@@ -532,17 +769,30 @@ function start(
   configDir: string,
   taskPath: string,
 ): void {
-  const resolvedTask = path.resolve(taskPath);
-  const taskInfo = fs.lstatSync(resolvedTask);
-  if (
-    !taskInfo.isFile() ||
-    taskInfo.isSymbolicLink() ||
-    taskInfo.size > 1024 * 1024
-  ) {
-    throw new Error("task must be a regular non-symlink file of at most 1 MiB");
+  const resolvedInput = path.resolve(taskPath);
+  const inputInfo = fs.lstatSync(resolvedInput);
+  let payload: ControllerStartPayload;
+  if (inputInfo.isDirectory() && !inputInfo.isSymbolicLink()) {
+    payload = buildBundlePayload(config, configDir, resolvedInput);
+  } else {
+    if (config.require_policy_bundle) {
+      throw new Error(
+        "controller requires a signed policy bundle directory; legacy task files are disabled",
+      );
+    }
+    if (
+      !inputInfo.isFile() ||
+      inputInfo.isSymbolicLink() ||
+      inputInfo.size > 1024 * 1024
+    ) {
+      throw new Error(
+        "task must be a regular non-symlink file of at most 1 MiB",
+      );
+    }
+    const task = fs.readFileSync(resolvedInput);
+    if (!task.toString("utf8").trim()) throw new Error("task file is empty");
+    payload = { mode: "task", task: task.toString("base64") };
   }
-  const task = fs.readFileSync(resolvedTask);
-  if (!task.toString("utf8").trim()) throw new Error("task file is empty");
   const keys = readControllerKeys(config, configDir);
   remotePython(
     config,
@@ -558,7 +808,10 @@ function start(
       Buffer.from(keys.publicKey).toString("base64"),
       keys.fingerprint,
     ],
-    { input: task.toString("base64"), timeoutMs: 75_000 },
+    {
+      input: Buffer.from(JSON.stringify(payload), "utf8").toString("base64"),
+      timeoutMs: 75_000,
+    },
   );
 }
 
@@ -570,7 +823,7 @@ expected_fingerprint=sys.argv[3]
 payload=json.loads(base64.b64decode(sys.argv[4]))
 root=pathlib.Path(sys.argv[5]).expanduser().resolve()
 session=sys.argv[6]
-expected_cwd=sys.argv[7]
+expected_cwd=str(pathlib.Path(sys.argv[7]).resolve())
 if control.resolve().parent!=root: raise SystemExit("control directory is outside configured root")
 enabled=control/"enabled.json"
 if not enabled.is_file() or enabled.is_symlink() or enabled.stat().st_size>65536: raise SystemExit("control capability unavailable")
@@ -729,6 +982,16 @@ function authorize(
     );
   }
   const parsed = parseDecision(rawDecision);
+  const pendingPolicyGate = status.state?.policy?.pendingGate;
+  if (
+    pendingPolicyGate &&
+    pendingPolicyGate.resolvedAt === undefined &&
+    (parsed.decision === "choice" || parsed.value !== undefined)
+  ) {
+    throw new Error(
+      "policy phase gates accept only exact approve, deny, or cancel decisions",
+    );
+  }
   sendEnvelope(
     config,
     status,
@@ -752,6 +1015,456 @@ result=subprocess.run(["tmux","capture-pane","-pt",f"{session}:0","-S","-160"],t
 if result.returncode: raise SystemExit(result.stderr)
 print(result.stdout,end="")
 `;
+
+const VERIFY_CODE = String.raw`
+import base64,hashlib,json,os,pathlib,subprocess,sys
+cwd=pathlib.Path(sys.argv[1]).resolve()
+team_run_id=sys.argv[2]
+state_root=(cwd/".team-state").resolve()
+control_root=pathlib.Path(sys.argv[3]).expanduser().resolve()
+state_path=state_root/f"{team_run_id}.json"
+def read_bytes(candidate,root,limit=4194304):
+  path=pathlib.Path(candidate)
+  resolved=path.resolve()
+  if resolved!=root and root not in resolved.parents: raise SystemExit(f"artifact escapes trusted root: {path}")
+  if not path.is_file() or path.is_symlink() or path.stat().st_size>limit:
+    raise SystemExit(f"artifact is not a small regular file: {path}")
+  return path.read_bytes()
+def read_json(candidate,root,limit=4194304):
+  return json.loads(read_bytes(candidate,root,limit))
+def workspace_sha256():
+  head=subprocess.run(["git","rev-parse","--verify","HEAD"],cwd=cwd,check=True,capture_output=True).stdout.strip()
+  if len(head)<40 or any(ch not in b"0123456789abcdef" for ch in head):
+    raise SystemExit("workspace Git HEAD is invalid")
+  listed=subprocess.run(["git","ls-files","-co","--exclude-standard","-z","--","."],cwd=cwd,check=True,capture_output=True).stdout
+  ignored=subprocess.run(["git","ls-files","-o","-i","--exclude-standard","-z","--","."],cwd=cwd,check=True,capture_output=True).stdout
+  paths=sorted(relative for relative in set((listed+ignored).split(b"\0")) if relative and not any(
+    relative==prefix or relative.startswith(prefix+b"/") for prefix in (b".team-state",b".cursor")
+  ))
+  digest=hashlib.sha256()
+  digest.update(b"coding-agent-team-workspace/v1\0"+head+b"\0")
+  total=0
+  for relative in paths:
+    candidate=cwd/os.fsdecode(relative)
+    digest.update(relative+b"\0")
+    try:
+      before=candidate.lstat()
+    except FileNotFoundError:
+      digest.update(b"missing\0")
+      continue
+    digest.update(str(before.st_mode & 0o777).encode()+b"\0")
+    if candidate.is_symlink():
+      target=os.readlink(candidate).encode()
+      digest.update(b"symlink\0"+str(len(target)).encode()+b"\0"+target+b"\0")
+      continue
+    if not candidate.is_file(): raise SystemExit(f"workspace path is not a file: {candidate}")
+    total+=before.st_size
+    if total>1073741824: raise SystemExit("workspace snapshot exceeds 1 GiB")
+    digest.update(b"file\0"+str(before.st_size).encode()+b"\0")
+    with candidate.open("rb") as stream:
+      while True:
+        chunk=stream.read(1048576)
+        if not chunk: break
+        digest.update(chunk)
+      after=os.fstat(stream.fileno())
+    if after.st_size!=before.st_size or after.st_mtime_ns!=before.st_mtime_ns:
+      raise SystemExit(f"workspace file changed while hashing: {candidate}")
+    digest.update(b"\0")
+  return digest.hexdigest()
+state=read_json(state_path,state_root,10485760)
+if state.get("teamRunId")!=team_run_id or state.get("cwd")!=str(cwd):
+  raise SystemExit("state binding mismatch")
+policy=state.get("policy") or {}
+seal_ref=policy.get("readinessSeal") or {}
+seal=read_json(seal_ref.get("path",""),state_root)
+artifacts={}
+for name,ref in (policy.get("artifacts") or {}).items():
+  artifacts[name]=(base64.b64encode(read_bytes(ref.get("path",""),state_root)).decode()
+                   if name=="task" else read_json(ref.get("path",""),state_root))
+test_config_sha256={}
+for selection in (artifacts.get("tests") or {}).get("selections",[]):
+  config_path=selection.get("configPath")
+  if config_path is not None:
+    test_config_sha256[selection.get("id")]=hashlib.sha256(
+      read_bytes(cwd/config_path,cwd,67108864)).hexdigest()
+reconciliations=[]
+for ref in policy.get("reconciliationRefs") or []:
+  reconciliations.append(read_json(ref.get("path",""),state_root))
+authorization_ids={gate.get("authorizationId") for gate in policy.get("gateHistory",[]) if gate.get("authorizationId")}
+authorizations={}
+processed=control_root/team_run_id/"processed"
+if processed.is_dir() and not processed.is_symlink():
+  for candidate in processed.glob("*.json"):
+    try:
+      item=read_json(candidate,processed,65536)
+      if item.get("id") in authorization_ids:
+        authorizations[item["id"]]=item
+    except Exception:
+      pass
+if set(authorizations)!=authorization_ids: raise SystemExit("one or more gate authorization envelopes were not found")
+print(json.dumps({"state":state,"seal":seal,"artifacts":artifacts,"testConfigSha256":test_config_sha256,"reconciliations":reconciliations,"authorizations":authorizations,"workspaceSha256":workspace_sha256(),"gitHead":subprocess.run(["git","rev-parse","--verify","HEAD"],cwd=cwd,check=True,capture_output=True,text=True).stdout.strip()}))
+`;
+
+function verifyLatestRun(
+  config: ControllerConfig,
+  configDir: string,
+): void {
+  const status = getStatus(config);
+  const state = status.state;
+  if (!state) throw new Error("no worker state is available");
+  if (status.capability?.active) {
+    throw new Error("worker run is still active; verify only after cleanup");
+  }
+  if (state.runStatus !== "ready" || !state.policy?.readinessSeal) {
+    throw new Error(
+      `latest run is not sealed ready (status=${state.runStatus ?? "unknown"})`,
+    );
+  }
+  if (
+    Object.values(state.processes ?? {}).some(
+      (record) =>
+        record.endedAt === undefined || record.status === "orphaned",
+    )
+  ) {
+    throw new Error("latest run still has active or orphaned processes");
+  }
+  const payload = JSON.parse(
+    remotePython(
+      config,
+      VERIFY_CODE,
+      [config.team_cwd, state.teamRunId, config.worker_control_root],
+      { capture: true },
+    ),
+  ) as {
+    state: TeamStateFile;
+    seal: unknown;
+    artifacts: Record<string, unknown>;
+    testConfigSha256: Record<string, string>;
+    reconciliations: unknown[];
+    authorizations: Record<string, unknown>;
+    workspaceSha256: string;
+    gitHead: string;
+  };
+  if (artifactSha256(payload.state) !== artifactSha256(state)) {
+    throw new Error("worker state changed during readiness verification");
+  }
+  const seal = verifyReadinessSeal(payload.seal);
+  if (
+    seal.teamRunId !== state.teamRunId ||
+    readinessSealSha256(seal) !== state.policy.readinessSeal.sha256
+  ) {
+    throw new Error("readiness seal does not match state");
+  }
+  for (const [name, ref] of Object.entries(state.policy.artifacts)) {
+    const artifact = payload.artifacts[name];
+    const actualSha256 =
+      name === "task" && typeof artifact === "string"
+        ? sha256(Buffer.from(artifact, "base64"))
+        : artifactSha256(artifact);
+    if (
+      artifact === undefined ||
+      actualSha256 !== ref.sha256 ||
+      seal.artifactSha256[name] !== ref.sha256
+    ) {
+      throw new Error(`readiness artifact verification failed: ${name}`);
+    }
+  }
+  const keys = readControllerKeys(config, configDir);
+  const binding = validateRunBinding(payload.artifacts.binding);
+  const profile = validatePolicyProfile(payload.artifacts.profile);
+  const commands = validateCommandManifest(payload.artifacts.commands);
+  const tests = validateTestManifest(payload.artifacts.tests, commands);
+  const accounting = validateAccountingConfig(payload.artifacts.accounting);
+  const commandById = new Map(
+    commands.commands.map((command) => [command.id, command]),
+  );
+  for (const receipt of state.receipts) {
+    const command = commandById.get(receipt.commandId);
+    const processRecord = state.processes[receipt.processId];
+    if (
+      !command ||
+      !processRecord ||
+      receipt.phase !== command.phase ||
+      receipt.kind !== command.kind ||
+      receipt.commandSha256 !== commandDigest(command) ||
+      !/^[0-9a-f]{64}$/.test(receipt.startedWorkspaceSha256) ||
+      !/^[0-9a-f]{64}$/.test(receipt.workspaceSha256) ||
+      processRecord.commandId !== receipt.commandId ||
+      processRecord.commandSha256 !== receipt.commandSha256 ||
+      processRecord.endedAt !== receipt.endedAt
+    ) {
+      throw new Error(`execution receipt is not bound to a manifest command`);
+    }
+  }
+  const latestByCommand = new Map<
+    string,
+    (typeof state.receipts)[number]
+  >();
+  for (const receipt of state.receipts) {
+    const prior = latestByCommand.get(receipt.commandId);
+    if (
+      !prior ||
+      receipt.endedAt > prior.endedAt ||
+      (receipt.endedAt === prior.endedAt &&
+        receipt.receiptId.localeCompare(prior.receiptId) > 0)
+    ) {
+      latestByCommand.set(receipt.commandId, receipt);
+    }
+  }
+  const passedCommandIds = new Set(
+    [...latestByCommand.values()]
+      .filter((receipt) => receipt.status === "passed")
+      .map((receipt) => receipt.commandId),
+  );
+  const missingCommands = commands.commands
+    .filter((command) => !passedCommandIds.has(command.id))
+    .map((command) => command.id);
+  if (missingCommands.length > 0) {
+    throw new Error(
+      `readiness lacks command receipts: ${missingCommands.join(", ")}`,
+    );
+  }
+  for (const selection of tests.selections) {
+    if (
+      selection.configPath !== null &&
+      payload.testConfigSha256[selection.id] !== selection.configSha256
+    ) {
+      throw new Error(`test configuration digest changed: ${selection.id}`);
+    }
+  }
+  if (
+    !verifyRunBinding(binding, keys.publicKey) ||
+    binding.teamRunId !== state.teamRunId ||
+    binding.workspace.cwd !== state.cwd ||
+    binding.workspace.gitHead !== payload.gitHead ||
+    binding.profileSha256 !== artifactSha256(profile) ||
+    binding.commandManifestSha256 !== artifactSha256(commands) ||
+    binding.testManifestSha256 !== artifactSha256(tests) ||
+    binding.accountingConfigSha256 !== artifactSha256(accounting) ||
+    binding.taskSha256 !==
+      sha256(Buffer.from(payload.artifacts.task as string, "base64")) ||
+    artifactSha256(binding) !== seal.bindingSha256 ||
+    seal.profileSha256 !== binding.profileSha256 ||
+    seal.profileId !== profile.profileId ||
+    seal.profileVersion !== profile.profileVersion ||
+    seal.terminalPhase !== profile.terminalPhase
+  ) {
+    throw new Error("signed run binding verification failed");
+  }
+  const reconciliationHashes = payload.reconciliations.map(artifactSha256);
+  if (
+    artifactSha256(reconciliationHashes) !==
+      artifactSha256(seal.reconciliationSha256) ||
+    reconciliationHashes.some(
+      (digest, index) =>
+        digest !== state.policy!.reconciliationRefs[index]?.sha256,
+    )
+  ) {
+    throw new Error("reconciliation chain verification failed");
+  }
+  const reconciliations =
+    payload.reconciliations as SpendReconciliation[];
+  const gates = state.policy.gateHistory;
+  if (
+    reconciliations.length !== gates.length ||
+    gates.length !== profile.transitions.length
+  ) {
+    throw new Error("phase gate/reconciliation chain length is invalid");
+  }
+  let previousReconciliation: SpendReconciliation | undefined;
+  for (let index = 0; index < gates.length; index++) {
+    const gate = gates[index]!;
+    const transition = profile.transitions[index]!;
+    const reconciliation = reconciliations[index]!;
+    if (
+      reconciliation.schema !== RECONCILIATION_SCHEMA ||
+      reconciliation.phase !== transition.from ||
+      reconciliation.verdict !== "pass" ||
+      reconciliation.previousSha256 !==
+        (previousReconciliation
+          ? artifactSha256(previousReconciliation)
+          : null) ||
+      artifactSha256(reconciliation.limits) !==
+        artifactSha256(accounting.limits)
+    ) {
+      throw new Error(`reconciliation ${index + 1} is invalid`);
+    }
+    const units = new Set([
+      ...Object.keys(accounting.limits),
+      ...Object.keys(reconciliation.totals),
+      ...Object.keys(reconciliation.delta),
+    ]);
+    for (const unit of units) {
+      const prior = BigInt(previousReconciliation?.totals[unit] ?? "0");
+      const delta = BigInt(reconciliation.delta[unit] ?? "0");
+      const total = BigInt(reconciliation.totals[unit] ?? "0");
+      const limit = accounting.limits[unit];
+      if (
+        limit === undefined ||
+        prior + delta !== total ||
+        total > BigInt(limit)
+      ) {
+        throw new Error(`reconciliation total is invalid for ${unit}`);
+      }
+    }
+    if (
+      new Set(reconciliation.eventIds).size !==
+        reconciliation.eventIds.length ||
+      artifactSha256([...reconciliation.eventIds].sort()) !==
+        artifactSha256(Object.keys(reconciliation.eventSha256).sort()) ||
+      Object.values(reconciliation.eventSha256).some(
+        (digest) => !/^[0-9a-f]{64}$/.test(digest),
+      )
+    ) {
+      throw new Error(`reconciliation event index ${index + 1} is invalid`);
+    }
+    if (previousReconciliation) {
+      for (const [eventId, digest] of Object.entries(
+        previousReconciliation.eventSha256,
+      )) {
+        if (reconciliation.eventSha256[eventId] !== digest) {
+          throw new Error(`reconciliation event changed: ${eventId}`);
+        }
+      }
+      for (const [slot, watermark] of Object.entries(
+        previousReconciliation.watermarks,
+      )) {
+        const current = reconciliation.watermarks[slot];
+        if (current === undefined || BigInt(current) < BigInt(watermark)) {
+          throw new Error(`reconciliation watermark regressed: ${slot}`);
+        }
+      }
+    }
+    if (
+      gate.from !== transition.from ||
+      gate.to !== transition.to ||
+      gate.decision !== "approve" ||
+      gate.resolvedAt === undefined ||
+      !gate.authorizationId ||
+      gate.workspaceGitHead !== binding.workspace.gitHead
+    ) {
+      throw new Error(`phase gate ${index + 1} is not approved`);
+    }
+    const phaseReceipts = [...latestByCommand.values()].filter(
+      (receipt) =>
+        receipt.phase === transition.from && receipt.status === "passed",
+    );
+    for (const receipt of phaseReceipts) {
+      const command = commandById.get(receipt.commandId);
+      if (
+        (command?.kind === "test" || command?.kind === "review") &&
+        (receipt.startedWorkspaceSha256 !== receipt.workspaceSha256 ||
+          receipt.workspaceSha256 !== gate.workspaceSha256)
+      ) {
+        throw new Error(
+          `workspace changed after ${command.kind} receipt: ${receipt.receiptId}`,
+        );
+      }
+    }
+    const receipts = phaseReceipts
+      .map((receipt) => ({
+        receiptId: receipt.receiptId,
+        commandId: receipt.commandId,
+        commandSha256: receipt.commandSha256,
+        startedWorkspaceSha256: receipt.startedWorkspaceSha256,
+        workspaceSha256: receipt.workspaceSha256,
+        status: receipt.status,
+      }))
+      .sort((left, right) => left.receiptId.localeCompare(right.receiptId));
+    const evidence = {
+      teamRunId: state.teamRunId,
+      profileSha256: binding.profileSha256,
+      bindingSha256: artifactSha256(binding),
+      from: transition.from,
+      to: transition.to,
+      commandManifestSha256: binding.commandManifestSha256,
+      testManifestSha256: binding.testManifestSha256,
+      workspaceSha256: gate.workspaceSha256,
+      workspaceGitHead: gate.workspaceGitHead,
+      priorGateHistorySha256: artifactSha256(gates.slice(0, index)),
+      testConfigSha256: Object.fromEntries(
+        tests.selections
+          .filter(
+            (selection) =>
+              selection.phase === transition.from &&
+              selection.configPath !== null,
+          )
+          .map((selection) => [
+            selection.id,
+            payload.testConfigSha256[selection.id]!,
+          ])
+          .sort(([left], [right]) => left.localeCompare(right)),
+      ),
+      receipts,
+      accounting: {
+        previousSha256: reconciliation.previousSha256,
+        sourceSha256: reconciliation.sourceSha256,
+        watermarks: reconciliation.watermarks,
+        eventIds: reconciliation.eventIds,
+        eventSha256: reconciliation.eventSha256,
+        delta: reconciliation.delta,
+        totals: reconciliation.totals,
+        limits: reconciliation.limits,
+        verdict: reconciliation.verdict,
+      },
+    };
+    if (artifactSha256(evidence) !== gate.evidenceSha256) {
+      throw new Error(`phase gate ${index + 1} evidence digest is invalid`);
+    }
+    const authorization = validateControlEnvelope(
+      payload.authorizations[gate.authorizationId],
+    );
+    if (
+      authorization.id !== gate.authorizationId ||
+      authorization.teamRunId !== state.teamRunId ||
+      authorization.decision !== "approve" ||
+      authorization.value !== undefined ||
+      authorization.questionSha256 !== questionSha256(gate.question) ||
+      !verifyControlEnvelope(authorization, keys.publicKey)
+    ) {
+      throw new Error(`phase gate ${index + 1} authorization is invalid`);
+    }
+    previousReconciliation = reconciliation;
+  }
+  if (
+    artifactSha256(state.receipts) !== seal.receiptsSha256 ||
+    artifactSha256(state.policy.gateHistory) !== seal.gateHistorySha256
+  ) {
+    throw new Error("readiness seal state digests do not match");
+  }
+  const finalGate = [...state.policy.gateHistory]
+    .reverse()
+    .find((gate) => gate.authorizationId === seal.finalAuthorizationId);
+  const finalAuthorization = finalGate?.authorizationId
+    ? validateControlEnvelope(
+        payload.authorizations[finalGate.authorizationId],
+      )
+    : undefined;
+  if (
+    !finalGate ||
+    !finalAuthorization ||
+    finalAuthorization.id !== seal.finalAuthorizationId ||
+    finalAuthorization.value !== undefined ||
+    finalGate.workspaceSha256 !== seal.workspaceSha256 ||
+    seal.workspaceSha256 !== payload.workspaceSha256 ||
+    artifactSha256(finalAuthorization) !==
+      seal.finalAuthorizationEnvelopeSha256
+  ) {
+    throw new Error("terminal authorization verification failed");
+  }
+  console.log(
+    JSON.stringify(
+      {
+        verified: true,
+        teamRunId: state.teamRunId,
+        sealSha256: readinessSealSha256(seal),
+        profile: `${seal.profileId}@${seal.profileVersion}`,
+      },
+      null,
+      2,
+    ),
+  );
+}
 
 function main(): void {
   const cli = parseCli(process.argv.slice(2));
@@ -790,6 +1503,10 @@ function main(): void {
     case "authorize":
       if (cli.rest.length !== 1) usage();
       authorize(config, configDir, cli.rest[0]!);
+      return;
+    case "verify":
+      if (cli.rest.length) usage();
+      verifyLatestRun(config, configDir);
       return;
     default:
       usage();

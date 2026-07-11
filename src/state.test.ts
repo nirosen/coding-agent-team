@@ -58,4 +58,8 @@ it("writes private atomic state and clears prior gate metadata", () => {
     fs.readdirSync(stateDir).some((name) => name.endsWith(".tmp")),
     false,
   );
+  assert.throws(
+    () => new TeamStateStore(stateDir, "team-1", root),
+    /refusing replay\/overwrite/,
+  );
 });

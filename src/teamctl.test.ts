@@ -62,6 +62,7 @@ describe("controller artifacts", () => {
     for (const dir of [home, teamCwd, harnessDir, fakeBin]) {
       fs.mkdirSync(dir, { recursive: true });
     }
+    const realTeamCwd = fs.realpathSync(teamCwd);
     fs.writeFileSync(
       path.join(fakeBin, "ssh"),
       [
@@ -129,7 +130,7 @@ describe("controller artifacts", () => {
     const state = new TeamStateStore(
       path.join(teamCwd, ".team-state"),
       "team-e2e",
-      teamCwd,
+      realTeamCwd,
     );
     state.upsert({
       jobId: "master-e2e",
@@ -139,7 +140,7 @@ describe("controller artifacts", () => {
     writeControlCapability(controlDir, {
       active: true,
       teamRunId: "team-e2e",
-      cwd: teamCwd,
+      cwd: realTeamCwd,
       pid: process.pid,
       host: os.hostname(),
       startedAt: Date.now(),
@@ -172,5 +173,18 @@ describe("controller artifacts", () => {
       }),
       true,
     );
+    writeControlCapability(controlDir, {
+      active: false,
+      teamRunId: "team-e2e",
+      cwd: realTeamCwd,
+      pid: process.pid,
+      host: os.hostname(),
+      startedAt: Date.now(),
+      stateFile: state.filePath,
+      publicKeyFingerprint: publicKeyFingerprint(publicKey),
+    });
+    const inactiveStatus = JSON.parse(teamctl("status"));
+    assert.equal(inactiveStatus.capability, null);
+    assert.equal(inactiveStatus.state.teamRunId, "team-e2e");
   });
 });

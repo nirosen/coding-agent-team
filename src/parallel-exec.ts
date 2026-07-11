@@ -2,6 +2,8 @@ import { ROLE_MODEL_CHAINS } from "./models.js";
 import { runJob, type JobOutcome } from "./run-job.js";
 import { executorShardPrompt } from "./specialties.js";
 import type { TeamStateStore } from "./state.js";
+import type { ProcessRegistry } from "./process-registry.js";
+import type { ProjectHookLease } from "./project-hook.js";
 
 export type ParallelExecOptions = {
   apiKey: string;
@@ -12,6 +14,8 @@ export type ParallelExecOptions = {
   state?: TeamStateStore;
   live?: boolean;
   verbose?: boolean;
+  processRegistry?: ProcessRegistry;
+  projectHook?: ProjectHookLease;
 };
 
 /**
@@ -34,6 +38,8 @@ export async function runParallelExec(
         jobId: `exec-${i}-${Date.now()}`,
         live: opts.live,
         verbose: opts.verbose,
+        processRegistry: opts.processRegistry,
+        projectHook: opts.projectHook,
       }),
     ),
   );

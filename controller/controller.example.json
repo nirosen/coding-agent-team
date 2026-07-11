@@ -8,5 +8,6 @@
   "private_key_path": "~/.coding-agent-team/controller.key",
   "public_key_path": "~/.coding-agent-team/controller.pub",
   "minimum_free_gb": 20,
-  "require_docker": true
+  "require_docker": true,
+  "require_policy_bundle": true
 }

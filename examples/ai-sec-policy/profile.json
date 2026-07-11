@@ -1,0 +1,50 @@
+{
+  "schema": "coding-agent-team-policy-profile/v1",
+  "profileId": "ai-sec-evaluation",
+  "profileVersion": "1",
+  "enforcement": "hard",
+  "phases": [
+    "selection",
+    "execution",
+    "verification",
+    "terminal"
+  ],
+  "terminalPhase": "terminal",
+  "transitions": [
+    {
+      "from": "selection",
+      "to": "execution",
+      "requires": [
+        "commands",
+        "receipts",
+        "accounting",
+        "authorization",
+        "idle"
+      ]
+    },
+    {
+      "from": "execution",
+      "to": "verification",
+      "requires": [
+        "commands",
+        "receipts",
+        "accounting",
+        "authorization",
+        "idle"
+      ]
+    },
+    {
+      "from": "verification",
+      "to": "terminal",
+      "requires": [
+        "commands",
+        "tests",
+        "receipts",
+        "review",
+        "accounting",
+        "authorization",
+        "idle"
+      ]
+    }
+  ]
+}
