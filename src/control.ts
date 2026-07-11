@@ -51,6 +51,8 @@ export type ControlCapability = {
   stateFile: string;
   controlDir: string;
   publicKeyFingerprint: string;
+  policyProfileSha256?: string;
+  runBindingSha256?: string;
 };
 
 export function defaultControlRoot(): string {

@@ -18,9 +18,12 @@ Distinguish confirmed state from inference and include the team run/job IDs.
 - Use `./teamctl steer "<short imperative>"` only when Nir explicitly asks to
   redirect the active run. A steer is guidance, not permission to cross a
   spend/deploy/destructive gate.
-- Use `./teamctl start <task-file>` only after Nir explicitly asks and status
+- Use `./teamctl start <bundle-directory>` only after Nir explicitly asks and status
   confirms no active matching harness. The configured worker cwd must be a
   dedicated clean clone/worktree, never a live run owned by another agent.
+- For a displayed policy phase gate, accept only `approve`, `deny`, or
+  `cancel`. Never convert a general instruction into a scoped or blanket
+  approval. The evidence digest in the question must remain unchanged.
 - Never stop, kill, pause, push, merge, deploy, or modify protected resources
   without an explicit current-turn instruction.
 
@@ -50,6 +53,7 @@ Distinguish confirmed state from inference and include the team run/job IDs.
 ./teamctl status
 ./teamctl tail
 ./teamctl steer "freeze accounting before the next named gate"
-./teamctl authorize "approve:phase-a"
-./teamctl start tasks/my-task.md
+./teamctl authorize approve
+./teamctl start bundles/run7
+./teamctl verify
 ```

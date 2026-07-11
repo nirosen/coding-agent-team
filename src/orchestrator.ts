@@ -2,6 +2,9 @@ import { MODELS, ROLE_MODEL_CHAINS } from "./models.js";
 import { runJob, type JobFail, type JobOutcome } from "./run-job.js";
 import { masterSystemPrompt, SPECIALTIES } from "./specialties.js";
 import type { TeamStateStore } from "./state.js";
+import type { ProcessRegistry } from "./process-registry.js";
+import type { PolicyRuntime } from "./policy-runtime.js";
+import type { ProjectHookLease } from "./project-hook.js";
 import type { SlackConfig } from "./slack-hitl.js";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
@@ -65,6 +68,9 @@ export type OrchestratorOptions = {
   interactiveHitl?: boolean;
   /** Signed controller and mid-run steer channel. */
   steer?: SteerHub;
+  processRegistry?: ProcessRegistry;
+  policy?: PolicyRuntime;
+  projectHook?: ProjectHookLease;
 };
 
 function buildMasterPrompt(opts: OrchestratorOptions): string {
@@ -79,6 +85,29 @@ function buildMasterPrompt(opts: OrchestratorOptions): string {
   }
   if (opts.execHint) {
     parts.push("", "## Exec hint", opts.execHint);
+  }
+  if (opts.policy) {
+    const phase = opts.policy.currentPhase();
+    const phaseIndex = opts.policy.profile.phases.indexOf(phase);
+    const nextPhase = opts.policy.profile.phases[phaseIndex + 1];
+    const commands = opts.policy.commands.commands
+      .filter((command) => command.phase === phase)
+      .map(
+        (command) =>
+          `- ${command.id} (${command.kind}, expected exits ${command.expectedExitCodes.join(",")})`,
+      );
+    parts.push(
+      "",
+      "## Signed hard-policy run",
+      `Current phase: ${phase}`,
+      `Next phase: ${nextPhase ?? "none"}`,
+      "Built-in Shell is denied. Run only signed commands through supervised_process.",
+      ...(commands.length ? commands : ["- No commands are declared for this phase."]),
+      nextPhase
+        ? `After the required receipts exist, call request_phase_transition with targetPhase=${nextPhase}.`
+        : "The terminal phase is sealed; do not execute more work.",
+      "Never edit .cursor/hooks.json or .team-state. A steer cannot change the signed manifests or budget.",
+    );
   }
   return parts.join("\n");
 }
@@ -271,10 +300,14 @@ export async function runOrchestrator(
       live: opts.live,
       verbose: opts.verbose,
       steer: opts.steer,
+      processRegistry: opts.processRegistry,
+      policy: opts.policy,
+      projectHook: opts.projectHook,
     });
 
     if (!outcome.ok) return outcome;
-    const question = extractHitl(outcome.streamedText);
+    const policyQuestion = opts.policy?.pendingQuestion();
+    const question = policyQuestion ?? extractHitl(outcome.streamedText);
     if (!question) return outcome;
     if (!opts.state) {
       return failedGate(
@@ -320,6 +353,17 @@ export async function runOrchestrator(
         source: authorization.source,
         authorizationId: authorization.authorizationId,
       });
+      if (policyQuestion) {
+        if (authorization.decision === "choice") {
+          throw new Error("policy gates do not accept choice decisions");
+        }
+        opts.policy!.authorizePending({
+          decision: authorization.decision,
+          authorizationId: authorization.authorizationId,
+          controlEnvelope:
+            authorization.controlMessage?.pendingControl.envelope,
+        });
+      }
       if (authorization.controlMessage) {
         opts.steer!.acknowledgeAuthorization(authorization.controlMessage);
       }

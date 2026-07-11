@@ -12,6 +12,9 @@ import {
   type LiveSession,
 } from "./session-view.js";
 import type { TeamStateStore } from "./state.js";
+import type { ProcessRegistry } from "./process-registry.js";
+import type { PolicyRuntime } from "./policy-runtime.js";
+import type { ProjectHookLease } from "./project-hook.js";
 import {
   formatSteerFollowUp,
   type SteerHub,
@@ -57,6 +60,9 @@ export type RunJobOptions = {
   live?: boolean;
   verbose?: boolean;
   steer?: SteerHub;
+  processRegistry?: ProcessRegistry;
+  policy?: PolicyRuntime;
+  projectHook?: ProjectHookLease;
 };
 
 type SDKRun = Awaited<
@@ -325,6 +331,10 @@ export async function runJob(opts: RunJobOptions): Promise<JobOutcome> {
   let lastError: string | undefined;
   const jobId = opts.jobId ?? `${opts.role}-${Date.now()}`;
   const live = opts.live !== false;
+  const stopOwnedProcesses = async (): Promise<void> => {
+    if (!opts.processRegistry) return;
+    await opts.processRegistry.stopOwner(jobId);
+  };
 
   for (const model of opts.modelChain) {
     attempts.push(model);
@@ -349,10 +359,29 @@ export async function runJob(opts: RunJobOptions): Promise<JobOutcome> {
     };
 
     try {
+      opts.projectHook?.verify();
+      const customTools = opts.processRegistry
+        ? {
+            supervised_process: opts.processRegistry.customTool(jobId),
+            ...(opts.policy && opts.role === "master"
+              ? { request_phase_transition: opts.policy.phaseTool() }
+              : {}),
+          }
+        : undefined;
       await using agent = await Agent.create({
         apiKey: opts.apiKey,
         model: { id: model },
-        local: { cwd: opts.cwd, autoReview: true },
+        local: {
+          cwd: opts.cwd,
+          autoReview: true,
+          ...(opts.projectHook
+            ? {
+                settingSources: ["project" as const],
+                sandboxOptions: { enabled: true },
+              }
+            : {}),
+          ...(customTools ? { customTools } : {}),
+        },
         ...(opts.agents ? { agents: opts.agents } : {}),
       });
 
@@ -360,6 +389,7 @@ export async function runJob(opts: RunJobOptions): Promise<JobOutcome> {
       let result: RunResult | undefined;
 
       for (let turn = 0; turn < MAX_CONVERSATION_TURNS; turn++) {
+        opts.projectHook?.verify();
         const run = await agent.send(nextPrompt);
         if (pendingSteer) {
           opts.steer?.acknowledgeSteer(pendingSteer);
@@ -397,6 +427,7 @@ export async function runJob(opts: RunJobOptions): Promise<JobOutcome> {
         });
 
         if (streamOutcome.kind === "steered") {
+          await stopOwnedProcesses();
           pendingSteer = streamOutcome.steer;
           // wait() must settle before a follow-up send on the same agent.
           let settled: RunResult | undefined;
@@ -428,12 +459,14 @@ export async function runJob(opts: RunJobOptions): Promise<JobOutcome> {
       }
 
       if (!result) {
+        await stopOwnedProcesses();
         lastError =
           "conversation turn limit reached; any unacknowledged steer remains queued";
         return { ok: false, role: opts.role, attempts, lastError, streamedText };
       }
 
       if (resultLooksLikeSafetyBlock(result, streamedText)) {
+        await stopOwnedProcesses();
         const fallback = nextModel(opts.modelChain, model);
         console.warn(
           `\n[${opts.role}] safety-block on ${model}` +
@@ -453,6 +486,7 @@ export async function runJob(opts: RunJobOptions): Promise<JobOutcome> {
       }
 
       if (result.status !== "finished") {
+        await stopOwnedProcesses();
         lastError = `run status=${result.status} id=${result.id}`;
         opts.state?.upsert({
           jobId,
@@ -466,6 +500,7 @@ export async function runJob(opts: RunJobOptions): Promise<JobOutcome> {
         return { ok: false, role: opts.role, attempts, lastError, streamedText };
       }
 
+      opts.processRegistry?.assertIdle(jobId);
       if (live) {
         renderJobDone(opts.role, model, result.status, attempts);
       } else {
@@ -495,7 +530,15 @@ export async function runJob(opts: RunJobOptions): Promise<JobOutcome> {
         opts.steer?.releaseSteer(pendingSteer);
         pendingSteer = undefined;
       }
-      lastError = error instanceof Error ? error.message : String(error);
+      let caught = error instanceof Error ? error.message : String(error);
+      try {
+        await stopOwnedProcesses();
+      } catch (cleanupError) {
+        caught = `${caught}; supervised cleanup failed: ${
+          cleanupError instanceof Error ? cleanupError.message : cleanupError
+        }`;
+      }
+      lastError = caught;
       if (allowsModelFallback(error)) {
         const fallback = nextModel(opts.modelChain, model);
         console.warn(

@@ -2,6 +2,8 @@ import { ROLE_MODEL_CHAINS } from "./models.js";
 import { runJob, type JobOutcome } from "./run-job.js";
 import { scoutPrompt } from "./specialties.js";
 import type { TeamStateStore } from "./state.js";
+import type { ProcessRegistry } from "./process-registry.js";
+import type { ProjectHookLease } from "./project-hook.js";
 
 export type FanOutOptions = {
   apiKey: string;
@@ -12,6 +14,8 @@ export type FanOutOptions = {
   state?: TeamStateStore;
   live?: boolean;
   verbose?: boolean;
+  processRegistry?: ProcessRegistry;
+  projectHook?: ProjectHookLease;
 };
 
 /**
@@ -38,6 +42,8 @@ export async function runFanOutScouts(
         jobId: `scout-${i}-${Date.now()}`,
         live: opts.live,
         verbose: opts.verbose,
+        processRegistry: opts.processRegistry,
+        projectHook: opts.projectHook,
       }),
     ),
   );

@@ -23,6 +23,11 @@ Nir
 - One writer lock protects each target cwd.
 - Durable state is written atomically under `<cwd>/.team-state/`.
 - Preflight can enforce free-space and Docker requirements before model spend.
+- Signed hard-policy bundles freeze commands, test selection, accounting
+  limits/adapters, workspace identity, and phase order before the first model
+  call.
+- Hard-policy commands run in harness-owned process groups. PID, PGID, Linux
+  boot/start identity, command digest, logs, and exit receipts remain durable.
 - Mid-turn cancellation is used only when the selected runtime supports it;
   otherwise a steer is applied after the current turn settles.
 - Cursor Auto-review is enabled for local SDK tool calls.
@@ -78,6 +83,40 @@ tmux attach -t coding-team
 
 Local SDK runs appear in this terminal, not Cursor’s cloud Agents Window.
 
+## Signed hard-policy run
+
+Hard-policy mode is opt-in through a controller-signed bundle and currently
+requires a dedicated Linux worktree. The unsigned controller-side directory
+contains `task.md`, `profile.json`, `commands.json`, `tests.json`, and
+`accounting.json`. `teamctl start <bundle-directory>` validates those files,
+binds them to the worker’s real path and Git HEAD, adds a signed `binding.json`,
+then launches:
+
+```bash
+npm run team -- \
+  --cwd /path/to/dedicated-worktree \
+  --run-bundle /secure/path/to/completed-bundle \
+  --controller-public-key /secure/path/controller.pub
+```
+
+During the run:
+
+- a temporary fail-closed project hook denies every built-in Shell call and
+  edits to `.cursor/hooks.json` or `.team-state`;
+- `supervised_process` accepts command IDs only from the signed manifest and
+  uses exact argv without a shell;
+- the harness refuses job/run completion while registered work is active;
+- every phase transition rechecks receipts, frozen test selection, process
+  idleness, source hashes, canonical spend events, watermarks, and limits;
+- the exact evidence digest is included in the signed authorization question;
+- only a signed final approval can produce the write-once readiness seal.
+
+An existing non-empty `.cursor/` directory, a non-Linux worker, changed bundle
+content, changed Git HEAD, stale/live process ownership, or changed gate
+evidence fails closed. This prevents project MCP/plugin settings from loading
+alongside the enforcement hook. Ordinary `--task`/`--task-file` runs retain the
+existing cooperative execution model and do not produce a readiness seal.
+
 ## Signed control plane
 
 With `--steer`, the harness accepts Ed25519-signed JSON envelopes in a
@@ -127,9 +166,10 @@ Controller commands:
 ```bash
 ./teamctl status
 ./teamctl tail
-./teamctl start tasks/my-task.md
+./teamctl start bundles/run7
 ./teamctl steer "freeze accounting before the next named gate"
-./teamctl authorize "approve:phase-a"
+./teamctl authorize approve
+./teamctl verify
 ```
 
 `status` is read-only. The Codex controller must obtain a current-turn user
@@ -141,17 +181,25 @@ the end-to-end controller flow first on a no-spend mock task.
 
 ## Enforcement boundary
 
-Signed controls authenticate who supplied guidance or a gate decision; they do
-not interpose on Cursor’s internal tool executor. The master is instructed to
-stop before named gates, and control-channel failure aborts or fails the run,
-but prompt policy alone is not a security boundary against a noncompliant
-model.
+Signed controls alone authenticate guidance and decisions; ordinary runs still
+do not interpose on Cursor’s internal tool executor. Hard-policy mode adds a
+project hook that denies built-in Shell and a manifest-aware custom execution
+tool. The hook manifest and state are protected from agent file-edit tools and
+verified before every SDK send.
 
-For hard guarantees, run the worker with least privilege: no production
-credentials, no deploy/push rights, isolated Docker resources, and OS/Cursor
-hooks that deny protected commands independently of the model. Authenticate
-out of band only after a matching gate. Do not treat the harness’s
-`HITL_REQUIRED` protocol as a substitute for those controls.
+This is not a kernel security boundary. A controller-authorized executable can
+still daemonize internally, move work to another host/service, or ask Docker to
+create daemon-owned resources. Common detachers, remote launchers, Docker
+detach/restart flags, and unmanaged Shell are denied; escaped process groups
+make the run unready rather than silently complete. Keep the dedicated worker
+least-privileged, with no production/deploy/push credentials, and use isolated
+Docker resources or stronger cgroup/container policy where those resources
+must be forcibly contained.
+
+Accounting proves consistency against the signed, hash-pinned adapter and its
+configured source files. It does not independently observe provider billing;
+the adapter must consume authoritative receipts stored outside model-writable
+paths when that guarantee is required.
 
 ## Slack HITL and optional steering
 
@@ -185,10 +233,16 @@ State file:
 <cwd>/.team-state/team-<teamRunId>.json
 ```
 
+Hard-policy artifacts, process logs, reconciliations, and the terminal seal are
+private files under `<cwd>/.team-state/<teamRunId>/`. `teamctl status` returns
+the latest inactive state after the harness exits, and `teamctl verify`
+recomputes artifact/state hashes and verifies the final Ed25519 authorization.
+
 Useful commands:
 
 ```bash
 npm run team -- --help
 npm run typecheck
 npm test
+npm run stage:no-spend  # Linux; no Cursor/model/provider calls
 ```

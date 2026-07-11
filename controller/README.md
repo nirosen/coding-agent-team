@@ -18,13 +18,15 @@ approval. It does not use `danger-full-access`.
 
 ```bash
 cp controller.example.json controller.json
-# Edit controller.json: point team_cwd at a dedicated next-task clone.
+# Edit controller.json: point team_cwd at a dedicated clean worktree.
 npm install
 ./teamctl self-test
 ./teamctl keygen
 ```
 
-Do not configure `team_cwd` to the live RUN6 workspace.
+Do not configure `team_cwd` to a live or previously failed evaluation
+workspace. Hard-policy mode refuses an existing project hook and replays of a
+previous run ID.
 
 ## Launch
 
@@ -43,4 +45,26 @@ The controller may query status at any time. `steer` and `authorize` work only
 for runs started with the matching public key. `start` installs that public key
 on the worker and launches the harness in a separate worker tmux session.
 
-Test the full flow first with a no-spend mock repository/task.
+For a supervised evaluation, prepare a directory containing `task.md`,
+`profile.json`, `commands.json`, `tests.json`, and `accounting.json`, then run:
+
+```bash
+./teamctl start bundles/run7
+./teamctl status
+./teamctl authorize approve  # only for the exact displayed gate
+./teamctl verify             # after terminal completion
+```
+
+`start` resolves the worker Git HEAD/path, generates the run ID, and signs the
+complete bundle locally. `verify` works after the worker tmux exits: it loads
+the latest inactive state, recomputes frozen-artifact, reconciliation, receipt,
+and gate-history hashes, and verifies the final Ed25519 authorization.
+
+Set `require_policy_bundle` in `controller.json` to reject legacy task-file
+starts. Test the full flow first with a disposable no-spend bundle.
+
+The hard-policy hook denies the SDK’s built-in Shell; only exact manifest
+commands can run through the harness supervisor. This does not independently
+measure provider billing or contain an executable that deliberately escapes
+its process group, so adapters must use authoritative receipts and the worker
+must remain least-privileged.

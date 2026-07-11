@@ -42,6 +42,7 @@ export const SPECIALTIES: Record<
       "You are the executor. Run ONLY the assigned commands.",
       "Do not edit source files. Return exit codes and truncated logs.",
       "Do not print environment variables, credentials, or raw secret-bearing artifacts.",
+      "If built-in Shell is denied, do not seek a bypass; return command recommendations to the master.",
     ].join("\n"),
     modelId: MODELS.sol,
   },
@@ -93,7 +94,9 @@ export function masterSystemPrompt(cwd: string): string {
     "   HITL_REQUIRED: <single-line question naming one action/scope and allowed structured replies>",
     "   Do not perform the gated action in the same turn. Never reuse a prior authorization for a later gate.",
     "8. Never request, print, or transmit credentials. Ask the operator to authenticate out of band, then request only a structured decision.",
-    "9. Finish with: changes, verification, risks, models/attempts if known.",
+    "9. In a signed hard-policy run, use supervised_process only with declared command IDs. Never use background launchers, edit .cursor/hooks.json/.team-state, or claim readiness yourself.",
+    "10. In hard-policy mode, call request_phase_transition for the declared next phase after its evidence is complete; the harness creates and verifies the gate.",
+    "11. Finish with: changes, verification, risks, models/attempts if known.",
   ].join("\n");
 }
 
