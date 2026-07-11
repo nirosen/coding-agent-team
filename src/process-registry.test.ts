@@ -75,7 +75,7 @@ describe("supervised process identity", () => {
             argv: [
               process.execPath,
               "-e",
-              "const fs=require('node:fs'),cp=require('node:child_process'),key='det'+'ached',child=cp.spawn(process.execPath,['-e','setTimeout(()=>{},60000)'],{stdio:'ignore',[key]:true});fs.writeFileSync('detached.pid',String(child.pid));child.unref()",
+              "const cp=require('node:child_process'),key='det'+'ached',child=cp.spawn(process.execPath,['-e',`setTimeout(()=>require('node:fs').writeFileSync('escaped.marker','yes'),500)`],{stdio:'ignore',[key]:true});child.unref()",
             ],
             cwd: ".",
             timeoutMs: 10_000,
@@ -119,10 +119,11 @@ describe("supervised process identity", () => {
       const escapedResult = await registry.wait(escaped.processId);
       assert.equal(escapedResult.status, "exited");
       assert.equal(receipts[1]?.status, "passed");
-      const detachedPid = Number(
-        fs.readFileSync(path.join(workspace, "detached.pid"), "utf8"),
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      assert.equal(
+        fs.existsSync(path.join(workspace, "escaped.marker")),
+        false,
       );
-      assert.throws(() => process.kill(detachedPid, 0), /ESRCH/);
       registry.assertIdle();
 
       const active = await registry.start("master-1", "wait");
