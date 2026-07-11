@@ -14,6 +14,7 @@ import {
   type CommandManifest,
   type ManifestCommand,
 } from "./manifests.js";
+import { requireGitHead, workspaceSnapshotSha256 } from "./workspace.js";
 
 const LOG_LIMIT_BYTES = 2 * 1024 * 1024;
 const TOOL_TAIL_CHARS = 16_000;
@@ -75,6 +76,7 @@ export type ExecutionReceipt = {
   ownerJobId: string;
   commandId: string;
   commandSha256: string;
+  workspaceSha256: string;
   phase: string;
   kind: ManifestCommand["kind"];
   startedAt: number;
@@ -333,6 +335,7 @@ export class ProcessRegistry {
       throw new Error("hard supervised execution currently requires Linux");
     }
     this.workspace = fs.realpathSync(opts.workspace);
+    requireGitHead(this.workspace);
     this.teamRunId = opts.teamRunId;
     this.stateDirectory = opts.stateDirectory;
     this.commands = new Map(
@@ -567,16 +570,7 @@ export class ProcessRegistry {
     });
     child.once("exit", (code, signal) => {
       setTimeout(() => {
-        const groupRemains = processGroupAlive(tracked.record.pgid);
-        const status: ProcessStatus = groupRemains
-          ? "orphaned"
-          : tracked.timedOut
-            ? "timed_out"
-            : code !== null &&
-                tracked.command.expectedExitCodes.includes(code)
-              ? "exited"
-              : "failed";
-        this.finish(tracked, code, signal, status, logFd);
+        void this.finishAfterExit(tracked, code, signal, logFd);
       }, 25);
     });
     tracked.timeout = setTimeout(() => {
@@ -594,6 +588,56 @@ export class ProcessRegistry {
     barrier.write("1");
     barrier.end();
     return structuredClone(record);
+  }
+
+  private async finishAfterExit(
+    tracked: Tracked,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    logFd: number,
+  ): Promise<void> {
+    let escapedGroup = processGroupAlive(tracked.record.pgid);
+    const hadEscapedGroup = escapedGroup;
+    if (escapedGroup) {
+      for (const [requestedSignal, waitMs] of [
+        ["SIGTERM", 500],
+        ["SIGKILL", 1_000],
+      ] as const) {
+        try {
+          process.kill(-tracked.record.pgid, requestedSignal);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") break;
+        }
+        const deadline = Date.now() + waitMs;
+        while (
+          Date.now() < deadline &&
+          processGroupAlive(tracked.record.pgid)
+        ) {
+          await delay(25);
+        }
+        if (!processGroupAlive(tracked.record.pgid)) break;
+      }
+      escapedGroup = processGroupAlive(tracked.record.pgid);
+    }
+    const status: ProcessStatus = escapedGroup
+      ? "orphaned"
+      : tracked.timedOut
+        ? "timed_out"
+        : hadEscapedGroup
+          ? "failed"
+          : code !== null &&
+              tracked.command.expectedExitCodes.includes(code)
+            ? "exited"
+            : "failed";
+    if (!escapedGroup && status === "exited") {
+      this.finish(tracked, code, signal, status, logFd);
+      return;
+    }
+    if (escapedGroup) {
+      tracked.record.lastError =
+        "process group remained alive after TERM/KILL cleanup";
+    }
+    this.finish(tracked, code, signal, status, logFd);
   }
 
   private finish(
@@ -632,6 +676,7 @@ export class ProcessRegistry {
       this.onProcess(structuredClone(tracked.record));
       const expectedExit =
         code !== null && tracked.command.expectedExitCodes.includes(code);
+      const workspaceSha256 = workspaceSnapshotSha256(this.workspace);
       this.onReceipt({
         schema: "coding-agent-team-execution-receipt/v1",
         receiptId: receiptId(tracked.command.id),
@@ -639,6 +684,7 @@ export class ProcessRegistry {
         ownerJobId: tracked.record.ownerJobId,
         commandId: tracked.command.id,
         commandSha256: tracked.record.commandSha256,
+        workspaceSha256,
         phase: tracked.command.phase,
         kind: tracked.command.kind,
         startedAt: tracked.record.startedAt,

@@ -492,8 +492,9 @@ import json,pathlib,subprocess,sys
 cwd=pathlib.Path(sys.argv[1]).resolve()
 if not cwd.is_dir(): raise SystemExit(f"team cwd not found: {cwd}")
 git=subprocess.run(["git","rev-parse","--verify","HEAD"],cwd=cwd,text=True,capture_output=True,timeout=10)
-head=git.stdout.strip() if git.returncode==0 else None
-if head is not None and (len(head)<40 or any(ch not in "0123456789abcdef" for ch in head)):
+if git.returncode!=0: raise SystemExit("hard-policy workspace requires a Git HEAD")
+head=git.stdout.strip()
+if len(head)<40 or any(ch not in "0123456789abcdef" for ch in head):
   raise SystemExit("workspace git HEAD is invalid")
 print(json.dumps({"cwd":str(cwd),"gitHead":head}))
 `;
@@ -985,9 +986,11 @@ function authorize(
   if (
     pendingPolicyGate &&
     pendingPolicyGate.resolvedAt === undefined &&
-    parsed.decision === "choice"
+    (parsed.decision === "choice" || parsed.value !== undefined)
   ) {
-    throw new Error("policy phase gates accept only approve, deny, or cancel");
+    throw new Error(
+      "policy phase gates accept only exact approve, deny, or cancel decisions",
+    );
   }
   sendEnvelope(
     config,
@@ -1014,7 +1017,7 @@ print(result.stdout,end="")
 `;
 
 const VERIFY_CODE = String.raw`
-import base64,hashlib,json,pathlib,sys
+import base64,hashlib,json,os,pathlib,subprocess,sys
 cwd=pathlib.Path(sys.argv[1]).resolve()
 team_run_id=sys.argv[2]
 state_root=(cwd/".team-state").resolve()
@@ -1029,6 +1032,44 @@ def read_bytes(candidate,root,limit=4194304):
   return path.read_bytes()
 def read_json(candidate,root,limit=4194304):
   return json.loads(read_bytes(candidate,root,limit))
+def workspace_sha256():
+  head=subprocess.run(["git","rev-parse","--verify","HEAD"],cwd=cwd,check=True,capture_output=True).stdout.strip()
+  if len(head)<40 or any(ch not in b"0123456789abcdef" for ch in head):
+    raise SystemExit("workspace Git HEAD is invalid")
+  listed=subprocess.run(["git","ls-files","-co","--exclude-standard","-z","--","."],cwd=cwd,check=True,capture_output=True).stdout
+  paths=sorted(relative for relative in listed.split(b"\0") if relative and not any(
+    relative==prefix or relative.startswith(prefix+b"/") for prefix in (b".team-state",b".cursor")
+  ))
+  digest=hashlib.sha256()
+  digest.update(b"coding-agent-team-workspace/v1\0"+head+b"\0")
+  total=0
+  for relative in paths:
+    candidate=cwd/os.fsdecode(relative)
+    digest.update(relative+b"\0")
+    try:
+      before=candidate.lstat()
+    except FileNotFoundError:
+      digest.update(b"missing\0")
+      continue
+    digest.update(str(before.st_mode & 0o777).encode()+b"\0")
+    if candidate.is_symlink():
+      target=os.readlink(candidate).encode()
+      digest.update(b"symlink\0"+str(len(target)).encode()+b"\0"+target+b"\0")
+      continue
+    if not candidate.is_file(): raise SystemExit(f"workspace path is not a file: {candidate}")
+    total+=before.st_size
+    if total>1073741824: raise SystemExit("workspace snapshot exceeds 1 GiB")
+    digest.update(b"file\0"+str(before.st_size).encode()+b"\0")
+    with candidate.open("rb") as stream:
+      while True:
+        chunk=stream.read(1048576)
+        if not chunk: break
+        digest.update(chunk)
+      after=os.fstat(stream.fileno())
+    if after.st_size!=before.st_size or after.st_mtime_ns!=before.st_mtime_ns:
+      raise SystemExit(f"workspace file changed while hashing: {candidate}")
+    digest.update(b"\0")
+  return digest.hexdigest()
 state=read_json(state_path,state_root,10485760)
 if state.get("teamRunId")!=team_run_id or state.get("cwd")!=str(cwd):
   raise SystemExit("state binding mismatch")
@@ -1060,7 +1101,7 @@ if processed.is_dir() and not processed.is_symlink():
     except Exception:
       pass
 if set(authorizations)!=authorization_ids: raise SystemExit("one or more gate authorization envelopes were not found")
-print(json.dumps({"state":state,"seal":seal,"artifacts":artifacts,"testConfigSha256":test_config_sha256,"reconciliations":reconciliations,"authorizations":authorizations}))
+print(json.dumps({"state":state,"seal":seal,"artifacts":artifacts,"testConfigSha256":test_config_sha256,"reconciliations":reconciliations,"authorizations":authorizations,"workspaceSha256":workspace_sha256(),"gitHead":subprocess.run(["git","rev-parse","--verify","HEAD"],cwd=cwd,check=True,capture_output=True,text=True).stdout.strip()}))
 `;
 
 function verifyLatestRun(
@@ -1103,6 +1144,8 @@ function verifyLatestRun(
     testConfigSha256: Record<string, string>;
     reconciliations: unknown[];
     authorizations: Record<string, unknown>;
+    workspaceSha256: string;
+    gitHead: string;
   };
   if (artifactSha256(payload.state) !== artifactSha256(state)) {
     throw new Error("worker state changed during readiness verification");
@@ -1146,6 +1189,7 @@ function verifyLatestRun(
       receipt.phase !== command.phase ||
       receipt.kind !== command.kind ||
       receipt.commandSha256 !== commandDigest(command) ||
+      !/^[0-9a-f]{64}$/.test(receipt.workspaceSha256) ||
       processRecord.commandId !== receipt.commandId ||
       processRecord.commandSha256 !== receipt.commandSha256 ||
       processRecord.endedAt !== receipt.endedAt
@@ -1178,6 +1222,7 @@ function verifyLatestRun(
     !verifyRunBinding(binding, keys.publicKey) ||
     binding.teamRunId !== state.teamRunId ||
     binding.workspace.cwd !== state.cwd ||
+    binding.workspace.gitHead !== payload.gitHead ||
     binding.profileSha256 !== artifactSha256(profile) ||
     binding.commandManifestSha256 !== artifactSha256(commands) ||
     binding.testManifestSha256 !== artifactSha256(tests) ||
@@ -1285,15 +1330,27 @@ function verifyLatestRun(
     ) {
       throw new Error(`phase gate ${index + 1} is not approved`);
     }
-    const receipts = state.receipts
-      .filter(
-        (receipt) =>
-          receipt.phase === transition.from && receipt.status === "passed",
-      )
+    const phaseReceipts = state.receipts.filter(
+      (receipt) =>
+        receipt.phase === transition.from && receipt.status === "passed",
+    );
+    for (const receipt of phaseReceipts) {
+      const command = commandById.get(receipt.commandId);
+      if (
+        (command?.kind === "test" || command?.kind === "review") &&
+        receipt.workspaceSha256 !== gate.workspaceSha256
+      ) {
+        throw new Error(
+          `workspace changed after ${command.kind} receipt: ${receipt.receiptId}`,
+        );
+      }
+    }
+    const receipts = phaseReceipts
       .map((receipt) => ({
         receiptId: receipt.receiptId,
         commandId: receipt.commandId,
         commandSha256: receipt.commandSha256,
+        workspaceSha256: receipt.workspaceSha256,
         status: receipt.status,
       }))
       .sort((left, right) => left.receiptId.localeCompare(right.receiptId));
@@ -1305,6 +1362,7 @@ function verifyLatestRun(
       to: transition.to,
       commandManifestSha256: binding.commandManifestSha256,
       testManifestSha256: binding.testManifestSha256,
+      workspaceSha256: gate.workspaceSha256,
       priorGateHistorySha256: artifactSha256(gates.slice(0, index)),
       testConfigSha256: Object.fromEntries(
         tests.selections
@@ -1367,6 +1425,8 @@ function verifyLatestRun(
     !finalGate ||
     !finalAuthorization ||
     finalAuthorization.id !== seal.finalAuthorizationId ||
+    finalGate.workspaceSha256 !== seal.workspaceSha256 ||
+    seal.workspaceSha256 !== payload.workspaceSha256 ||
     artifactSha256(finalAuthorization) !==
       seal.finalAuthorizationEnvelopeSha256
   ) {

@@ -7,7 +7,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { assertChainsEndOnGrok } from "./models.js";
 import { runFanOutScouts } from "./fan-out.js";
 import { runOrchestrator } from "./orchestrator.js";
@@ -42,6 +41,7 @@ import {
   validateTestManifest,
 } from "./manifests.js";
 import { validateAccountingConfig } from "./accounting.js";
+import { requireGitHead } from "./workspace.js";
 
 function usage(exitCode = 1): never {
   const text = `Usage:
@@ -317,21 +317,6 @@ function readSmallRegularFile(
   }
 }
 
-function gitHead(cwd: string): string | null {
-  const result = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
-    cwd,
-    encoding: "utf8",
-    timeout: 10_000,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (result.status !== 0) return null;
-  const head = result.stdout.trim();
-  if (!/^[0-9a-f]{40,64}$/.test(head)) {
-    throw new Error("workspace git HEAD is invalid");
-  }
-  return head;
-}
-
 function loadPolicyBundle(
   args: CliArgs,
   publicKey: { path: string; pem: string } | undefined,
@@ -351,7 +336,7 @@ function loadPolicyBundle(
   return loadRunBundle(args.runBundle, {
     publicKeyPem: publicKey.pem,
     expectedCwd: args.cwd!,
-    expectedGitHead: gitHead(args.cwd!),
+    expectedGitHead: requireGitHead(args.cwd!),
   });
 }
 

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -35,6 +36,22 @@ describe("supervised process identity", () => {
         path.join(os.tmpdir(), "process-registry-"),
       );
       const stateDirectory = path.join(workspace, ".team-state");
+      fs.writeFileSync(path.join(workspace, "README.md"), "fixture\n");
+      execFileSync("git", ["init", "-q"], { cwd: workspace });
+      execFileSync("git", ["add", "README.md"], { cwd: workspace });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=Fixture",
+          "-c",
+          "user.email=fixture@example.invalid",
+          "commit",
+          "-qm",
+          "fixture",
+        ],
+        { cwd: workspace },
+      );
       const records: ProcessRecord[] = [];
       const receipts: ExecutionReceipt[] = [];
       const manifest = validateCommandManifest({
@@ -50,6 +67,21 @@ describe("supervised process identity", () => {
             envAllowlist: [],
             executableSha256: sha256(fs.readFileSync(process.execPath)),
             expectedExitCodes: [7],
+          },
+          {
+            id: "escape-group",
+            phase: "execution",
+            kind: "command",
+            argv: [
+              process.execPath,
+              "-e",
+              "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},60000)'],{stdio:'ignore'}).unref()",
+            ],
+            cwd: ".",
+            timeoutMs: 10_000,
+            envAllowlist: [],
+            executableSha256: sha256(fs.readFileSync(process.execPath)),
+            expectedExitCodes: [0],
           },
           {
             id: "wait",
@@ -82,6 +114,12 @@ describe("supervised process identity", () => {
         JSON.stringify(records).includes("process.exit(7)"),
         false,
       );
+
+      const escaped = await registry.start("master-1", "escape-group");
+      const escapedResult = await registry.wait(escaped.processId);
+      assert.equal(escapedResult.status, "failed");
+      assert.equal(receipts[1]?.status, "failed");
+      registry.assertIdle();
 
       const active = await registry.start("master-1", "wait");
       assert.throws(() => registry.assertIdle(), /still active/);

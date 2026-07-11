@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -36,6 +37,7 @@ import {
 } from "./policy-runtime.js";
 import type { ProcessRegistry } from "./process-registry.js";
 import { TeamStateStore } from "./state.js";
+import { requireGitHead, workspaceSnapshotSha256 } from "./workspace.js";
 
 describe("policy phase gates and readiness", () => {
   it("seals only an evidence-stable, signed, terminal transition", () => {
@@ -61,6 +63,26 @@ describe("policy phase gates and readiness", () => {
       ].join("\n"),
       { mode: 0o700 },
     );
+    fs.writeFileSync(
+      path.join(workspace, ".gitignore"),
+      ".team-state/\n.cursor/\n",
+    );
+    execFileSync("git", ["init", "-q"], { cwd: workspace });
+    execFileSync("git", ["add", "."], { cwd: workspace });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-qm",
+        "fixture",
+      ],
+      { cwd: workspace },
+    );
+    const gitHead = requireGitHead(workspace);
     const profile: PolicyProfile = {
       schema: POLICY_PROFILE_SCHEMA,
       profileId: "no-spend",
@@ -153,7 +175,7 @@ describe("policy phase gates and readiness", () => {
         commandManifestSha256: artifactSha256(commands),
         testManifestSha256: artifactSha256(tests),
         accountingConfigSha256: artifactSha256(accounting),
-        workspace: { cwd: workspace, gitHead: null },
+        workspace: { cwd: workspace, gitHead },
       },
       keys.privateKeyPem,
     );
@@ -195,6 +217,7 @@ describe("policy phase gates and readiness", () => {
         ownerJobId: "master-1",
         commandId: command.id,
         commandSha256: commandDigest(command),
+        workspaceSha256: workspaceSnapshotSha256(workspace),
         phase: command.phase,
         kind: command.kind,
         startedAt: now,
@@ -230,7 +253,7 @@ describe("policy phase gates and readiness", () => {
           authorizationId: authorization.id,
           controlEnvelope: authorization,
         }),
-      /evidence changed/,
+      /evidence changed|workspace changed/,
     );
     fs.writeFileSync(ledger, "");
     runtime.authorizePending({

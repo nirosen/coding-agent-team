@@ -107,9 +107,11 @@ During the run:
   uses exact argv without a shell;
 - the harness refuses job/run completion while registered work is active;
 - every phase transition rechecks receipts, frozen test selection, process
-  idleness, source hashes, canonical spend events, watermarks, and limits;
+  idleness, source hashes, canonical spend events, watermarks, limits, and a
+  Git-backed working-tree digest; test/review receipts become stale after edits;
 - the exact evidence digest is included in the signed authorization question;
-- only a signed final approval can produce the write-once readiness seal.
+- only an exact signed final approval can produce the write-once readiness
+  seal, and no further model turn runs after that seal.
 
 An existing non-empty `.cursor/` directory, a non-Linux worker, changed bundle
 content, changed Git HEAD, stale/live process ownership, or changed gate

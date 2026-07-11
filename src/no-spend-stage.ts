@@ -42,15 +42,40 @@ import {
 import { ProcessRegistry } from "./process-registry.js";
 import { installDenyShellProjectHook } from "./project-hook.js";
 import { TeamStateStore } from "./state.js";
+import { requireGitHead } from "./workspace.js";
 
 function writeJson(filePath: string, value: unknown): void {
   fs.writeFileSync(filePath, `${canonicalJson(value)}\n`, { mode: 0o600 });
+}
+
+function initializeGitWorkspace(workspace: string): string {
+  fs.writeFileSync(
+    path.join(workspace, ".gitignore"),
+    ".team-state/\n.cursor/\n",
+  );
+  execFileSync("git", ["init", "-q"], { cwd: workspace });
+  execFileSync("git", ["add", "."], { cwd: workspace });
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=No Spend Stage",
+      "-c",
+      "user.email=no-spend@example.invalid",
+      "commit",
+      "-qm",
+      "fixture",
+    ],
+    { cwd: workspace },
+  );
+  return requireGitHead(workspace);
 }
 
 async function exerciseCancellation(root: string): Promise<void> {
   const workspace = fs.realpathSync(
     fs.mkdtempSync(path.join(root, "cancel-workspace-")),
   );
+  initializeGitWorkspace(workspace);
   const manifest = validateCommandManifest({
     schema: COMMAND_MANIFEST_SCHEMA,
     commands: [
@@ -127,6 +152,7 @@ async function stage(): Promise<void> {
     `${canonicalJson({ tests: ["no-provider-fixture"] })}\n`,
     { mode: 0o600 },
   );
+  const gitHead = initializeGitWorkspace(workspace);
   const profile: PolicyProfile = {
     schema: POLICY_PROFILE_SCHEMA,
     profileId: "no-spend-mec-stage",
@@ -220,7 +246,7 @@ async function stage(): Promise<void> {
       commandManifestSha256: artifactSha256(commands),
       testManifestSha256: artifactSha256(tests),
       accountingConfigSha256: artifactSha256(accounting),
-      workspace: { cwd: workspace, gitHead: null },
+      workspace: { cwd: workspace, gitHead },
     },
     keys.privateKeyPem,
   );
@@ -234,7 +260,7 @@ async function stage(): Promise<void> {
   const loaded = loadRunBundle(bundleDirectory, {
     publicKeyPem: keys.publicKeyPem,
     expectedCwd: workspace,
-    expectedGitHead: null,
+    expectedGitHead: gitHead,
   });
   const stateDirectory = path.join(workspace, ".team-state");
   const state = new TeamStateStore(

@@ -34,6 +34,7 @@ import {
   type PolicyGateRecord,
   type TeamStateStore,
 } from "./state.js";
+import { requireGitHead, workspaceSnapshotSha256 } from "./workspace.js";
 
 export const READINESS_SEAL_SCHEMA = "coding-agent-team-readiness-seal/v1";
 
@@ -57,6 +58,7 @@ export type ReadinessSeal = {
   gateHistorySha256: string;
   finalAuthorizationId: string;
   finalAuthorizationEnvelopeSha256: string;
+  workspaceSha256: string;
   sealedAt: number;
 };
 
@@ -203,6 +205,11 @@ export class PolicyRuntime {
     }
     this.state = opts.state;
     this.workspace = fs.realpathSync(opts.workspace);
+    if (
+      opts.bundle.binding.workspace.gitHead !== requireGitHead(this.workspace)
+    ) {
+      throw new Error("policy runtime Git HEAD does not match the signed binding");
+    }
     this.runArtifactDirectory = path.join(
       opts.stateDirectory,
       opts.bundle.binding.teamRunId,
@@ -316,6 +323,7 @@ export class PolicyRuntime {
       (receipt) =>
         receipt.phase === transition.from && receipt.status === "passed",
     );
+    const workspaceSha256 = workspaceSnapshotSha256(this.workspace);
     for (const receipt of passedReceipts) {
       const command = this.commands.commands.find(
         (candidate) => candidate.id === receipt.commandId,
@@ -323,6 +331,14 @@ export class PolicyRuntime {
       if (!command || receipt.commandSha256 !== commandDigest(command)) {
         throw new Error(
           `execution receipt does not match the frozen command: ${receipt.receiptId}`,
+        );
+      }
+      if (
+        (command.kind === "test" || command.kind === "review") &&
+        receipt.workspaceSha256 !== workspaceSha256
+      ) {
+        throw new Error(
+          `workspace changed after ${command.kind} receipt: ${receipt.receiptId}`,
         );
       }
     }
@@ -432,6 +448,7 @@ export class PolicyRuntime {
         to: transition.to,
         commandManifestSha256: this.bundle.binding.commandManifestSha256,
         testManifestSha256: this.bundle.binding.testManifestSha256,
+        workspaceSha256,
         priorGateHistorySha256: artifactSha256(
           (snapshot.policy?.gateHistory ?? []).filter(
             (gate) => gate.resolvedAt !== undefined,
@@ -443,6 +460,7 @@ export class PolicyRuntime {
             receiptId: receipt.receiptId,
             commandId: receipt.commandId,
             commandSha256: receipt.commandSha256,
+            workspaceSha256: receipt.workspaceSha256,
             status: receipt.status,
           }))
           .sort((left, right) => left.receiptId.localeCompare(right.receiptId)),
@@ -469,6 +487,7 @@ export class PolicyRuntime {
       from: transition.from,
       to: transition.to,
       evidenceSha256,
+      workspaceSha256: collected.evidence.workspaceSha256 as string,
       question,
       questionSha256: sha256(question.trim()),
       requestedAt: Date.now(),
@@ -515,16 +534,21 @@ export class PolicyRuntime {
   }
 
   assertReady(): void {
-    const state = this.state.snapshot();
-    if (
-      state.runStatus !== "ready" ||
-      state.policy?.currentPhase !== this.profile.terminalPhase ||
-      !state.policy.readinessSeal
-    ) {
+    if (!this.isReady()) {
+      const state = this.state.snapshot();
       throw new Error(
         `hard-policy run is not sealed ready (phase=${state.policy?.currentPhase ?? "unknown"})`,
       );
     }
+  }
+
+  isReady(): boolean {
+    const state = this.state.snapshot();
+    return (
+      state.runStatus === "ready" &&
+      state.policy?.currentPhase === this.profile.terminalPhase &&
+      Boolean(state.policy.readinessSeal)
+    );
   }
 
   private writeReadinessSeal(): void {
@@ -582,6 +606,9 @@ export class PolicyRuntime {
       finalAuthorizationEnvelopeSha256: artifactSha256(
         authorization.controlEnvelope,
       ),
+      workspaceSha256:
+        snapshot.policy?.gateHistory.at(-1)?.workspaceSha256 ??
+        workspaceSnapshotSha256(this.workspace),
       sealedAt: Date.now(),
     };
     const ref = writeArtifact(
@@ -612,6 +639,7 @@ export function verifyReadinessSeal(value: unknown): ReadinessSeal {
     "gateHistorySha256",
     "finalAuthorizationId",
     "finalAuthorizationEnvelopeSha256",
+    "workspaceSha256",
     "sealedAt",
   ];
   const unknown = Object.keys(seal).find((key) => !expected.includes(key));
@@ -645,6 +673,7 @@ export function verifyReadinessSeal(value: unknown): ReadinessSeal {
     "receiptsSha256",
     "gateHistorySha256",
     "finalAuthorizationEnvelopeSha256",
+    "workspaceSha256",
   ]) {
     if (
       typeof seal[field] !== "string" ||

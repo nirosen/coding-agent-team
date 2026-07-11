@@ -52,6 +52,11 @@ describe("hard-policy project hook", () => {
       },
     );
     assert.equal(JSON.parse(editOutput).permission, "deny");
+    const mcpPath = path.join(workspace, ".cursor", "mcp.json");
+    fs.writeFileSync(mcpPath, '{"mcpServers":{}}\n');
+    assert.throws(() => lease.verify(), /MCP\/plugin settings/);
+    fs.unlinkSync(mcpPath);
+    lease.verify();
     lease.release();
     assert.equal(fs.existsSync(path.join(workspace, ".cursor")), false);
   });

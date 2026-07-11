@@ -188,6 +188,12 @@ export function installDenyShellProjectHook(opts: {
   let released = false;
   const verify = (): void => {
     if (released) throw new Error("project hook lease is already released");
+    const entries = fs.readdirSync(cursorDirectory);
+    if (entries.length !== 1 || entries[0] !== "hooks.json") {
+      throw new Error(
+        "hard-policy .cursor directory changed; refusing project MCP/plugin settings",
+      );
+    }
     if (sha256(safeRead(hookPath)) !== installedSha256) {
       throw new Error(
         "hard-policy project hook changed; refusing to create or continue an agent",

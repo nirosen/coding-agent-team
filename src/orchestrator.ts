@@ -353,9 +353,17 @@ export async function runOrchestrator(
         source: authorization.source,
         authorizationId: authorization.authorizationId,
       });
+      if (authorization.controlMessage) {
+        opts.steer!.acknowledgeAuthorization(authorization.controlMessage);
+      }
       if (policyQuestion) {
-        if (authorization.decision === "choice") {
-          throw new Error("policy gates do not accept choice decisions");
+        if (
+          authorization.decision === "choice" ||
+          authorization.answer.toLowerCase() !== authorization.decision
+        ) {
+          throw new Error(
+            "policy gates accept only exact approve, deny, or cancel decisions",
+          );
         }
         opts.policy!.authorizePending({
           decision: authorization.decision,
@@ -364,9 +372,6 @@ export async function runOrchestrator(
             authorization.controlMessage?.pendingControl.envelope,
         });
       }
-      if (authorization.controlMessage) {
-        opts.steer!.acknowledgeAuthorization(authorization.controlMessage);
-      }
     } catch (error) {
       return failedGate(
         opts,
@@ -374,6 +379,17 @@ export async function runOrchestrator(
         jobId,
         `authorization audit failed: ${error instanceof Error ? error.message : error}`,
       );
+    }
+
+    if (policyQuestion && opts.policy?.isReady()) {
+      opts.state?.upsert({
+        jobId,
+        role: "master",
+        status: "finished",
+        lastError: undefined,
+        lastEventAt: Date.now(),
+      });
+      return outcome;
     }
 
     if (
