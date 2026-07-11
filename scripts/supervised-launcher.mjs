@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import fs from "node:fs";
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -26,8 +25,9 @@ if (
 }
 
 // The parent persists this launcher's PID/process identity before releasing
-// the exact manifest command. fd 3 is a private one-byte startup barrier.
-const barrier = fs.createReadStream(null, { fd: 3, autoClose: true });
+// the exact manifest command. stdin is a private one-byte startup barrier;
+// the manifest command itself always receives stdin="ignore".
+const barrier = process.stdin;
 barrier.once("data", () => {
   const child = spawn(payload.argv[0], payload.argv.slice(1), {
     cwd: payload.cwd,

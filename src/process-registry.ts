@@ -491,7 +491,7 @@ export class ProcessRegistry {
       env,
       detached: true,
       shell: false,
-      stdio: ["ignore", "pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     if (!child.pid) {
       fs.closeSync(logFd);
@@ -586,8 +586,8 @@ export class ProcessRegistry {
     }, command.timeoutMs);
 
     this.publish(tracked, "running");
-    const barrier = child.stdio[3];
-    if (!barrier || !("write" in barrier)) {
+    const barrier = child.stdin;
+    if (!barrier) {
       await this.stop(processId, "SIGKILL");
       throw new Error("supervised launcher startup barrier is unavailable");
     }
