@@ -28,7 +28,9 @@ if (
 // the exact manifest command. stdin is a private one-byte startup barrier;
 // the manifest command itself always receives stdin="ignore".
 const barrier = process.stdin;
+let released = false;
 barrier.once("data", () => {
+  released = true;
   const child = spawn(payload.argv[0], payload.argv.slice(1), {
     cwd: payload.cwd,
     env: process.env,
@@ -44,5 +46,7 @@ barrier.once("data", () => {
     process.exit(code ?? 125);
   });
 });
-barrier.once("end", () => fail("startup barrier closed without release"));
+barrier.once("end", () => {
+  if (!released) fail("startup barrier closed without release");
+});
 barrier.once("error", (error) => fail(`startup barrier failed: ${error.message}`));
