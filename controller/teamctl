@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONTROLLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HARNESS_DIR="$(cd "$CONTROLLER_DIR/.." && pwd)"
+CONFIG="${AISEC_CONTROLLER_CONFIG:-$CONTROLLER_DIR/controller.json}"
+
+exec npm --prefix "$HARNESS_DIR" run teamctl -- --config "$CONFIG" "$@"

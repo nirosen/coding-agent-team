@@ -1,10 +1,10 @@
 import type { SDKMessage } from "@cursor/sdk";
+import { redactSecrets } from "./control.js";
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
-const magenta = (s: string) => `\x1b[35m${s}\x1b[0m`;
 
 export type LiveSession = {
   role: string;
@@ -12,6 +12,8 @@ export type LiveSession = {
   verbose: boolean;
   /** Track whether we are mid assistant text line. */
   _inText?: boolean;
+  /** Track whether we are mid a verbose thinking stream. */
+  _inThink?: boolean;
 };
 
 export function banner(role: string, model: string, extra?: string): void {
@@ -29,7 +31,8 @@ function summarizeToolArgs(name: string, args: unknown): string {
       const v = r[k];
       if (typeof v === "string" && v.trim()) {
         const t = v.replace(/\s+/g, " ").trim();
-        return t.length > 100 ? `${t.slice(0, 97)}...` : t;
+        const summarized = t.length > 100 ? `${t.slice(0, 97)}...` : t;
+        return redactSecrets(summarized);
       }
     }
     return "";
@@ -48,6 +51,10 @@ function summarizeToolArgs(name: string, args: unknown): string {
 }
 
 function endTextIfNeeded(session: LiveSession): void {
+  if (session._inThink) {
+    process.stdout.write("\n");
+    session._inThink = false;
+  }
   if (session._inText) {
     process.stdout.write("\n");
     session._inText = false;
@@ -68,28 +75,44 @@ export function renderStreamEvent(
     case "system":
       if (session.verbose) {
         endTextIfNeeded(session);
-        console.log(dim(`[system] ${JSON.stringify(event).slice(0, 200)}`));
+        console.log(
+          dim(`[system] ${redactSecrets(JSON.stringify(event).slice(0, 200))}`),
+        );
       }
       break;
 
     case "thinking":
-      endTextIfNeeded(session);
-      if ("text" in event && typeof event.text === "string" && event.text) {
-        const t = event.text.replace(/\s+/g, " ").trim();
-        if (t) {
-          console.log(
-            `${magenta("⋯ think")} ${dim(t.length > 160 ? `${t.slice(0, 157)}...` : t)}`,
-          );
+      // Default: hide model thinking (SDK often emits one word per event).
+      // --verbose: stream dim text on one line, no per-word pink prefix.
+      if (
+        session.verbose &&
+        "text" in event &&
+        typeof event.text === "string" &&
+        event.text
+      ) {
+        if (session._inText) {
+          process.stdout.write("\n");
+          session._inText = false;
         }
+        if (!session._inThink) {
+          process.stdout.write(`${dim("⋯ ")}`);
+          session._inThink = true;
+        }
+        process.stdout.write(dim(redactSecrets(event.text)));
       }
       break;
 
     case "assistant":
       for (const block of event.message.content) {
         if (block.type === "text") {
-          process.stdout.write(block.text);
+          if (session._inThink) {
+            process.stdout.write("\n");
+            session._inThink = false;
+          }
+          const text = redactSecrets(block.text);
+          process.stdout.write(text);
           session._inText = true;
-          textDelta += block.text;
+          textDelta += text;
         } else if (block.type === "tool_use") {
           endTextIfNeeded(session);
           const detail = summarizeToolArgs(block.name, block.input);
@@ -117,14 +140,14 @@ export function renderStreamEvent(
     case "status":
       endTextIfNeeded(session);
       console.log(
-        `${dim("● status")} ${event.status}${event.message ? dim(` — ${event.message}`) : ""}`,
+        `${dim("● status")} ${event.status}${event.message ? dim(` — ${redactSecrets(event.message)}`) : ""}`,
       );
       break;
 
     case "task":
       endTextIfNeeded(session);
       console.log(
-        `${cyan("▸ task")} ${event.status ?? ""}${event.text ? ` ${event.text}` : ""}`,
+        `${cyan("▸ task")} ${event.status ?? ""}${event.text ? ` ${redactSecrets(event.text)}` : ""}`,
       );
       break;
 

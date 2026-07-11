@@ -1,6 +1,11 @@
 import type { SlackConfig } from "./slack-hitl.js";
-import { postHitlQuestion, postWebhookAlert, slackHitlEnabled } from "./slack-hitl.js";
+import {
+  postSlackMessage,
+  postWebhookAlert,
+  slackPostingEnabled,
+} from "./slack-hitl.js";
 import type { TeamStateStore } from "./state.js";
+import { redactSecrets } from "./control.js";
 
 export type WatchdogOptions = {
   state: TeamStateStore;
@@ -45,22 +50,20 @@ async function tick(
       lastEventAt: Date.now(),
     });
 
-    const text = [
+    const text = redactSecrets([
       `*watchdog*: job \`${job.jobId}\` looks ${job.status === "awaiting_human" ? "waiting on you" : "stale/idle"}`,
       `role=${job.role} model=${job.model ?? "?"} attempts=${(job.attempts ?? []).join("→") || "?"}`,
       job.hitlQuestion ? `HITL: ${job.hitlQuestion}` : "",
       job.lastError ? `error: ${job.lastError}` : "",
     ]
       .filter(Boolean)
-      .join("\n");
+      .join("\n"));
 
     try {
-      if (slackHitlEnabled(opts.slack)) {
-        await postHitlQuestion(opts.slack, {
-          jobId: job.jobId,
-          question: text,
-          allowedReplies: "reply with guidance, approve|deny, or cancel",
-        });
+      if (slackPostingEnabled(opts.slack)) {
+        // Alert only. Opening another HITL thread would compete with the
+        // orchestrator's authoritative thread/control gate.
+        await postSlackMessage(opts.slack, text);
       } else if (opts.slack.webhookUrl) {
         await postWebhookAlert(opts.slack.webhookUrl, text);
       } else {

@@ -1,18 +1,51 @@
 import { MODELS, ROLE_MODEL_CHAINS } from "./models.js";
-import { runJob, type JobOutcome } from "./run-job.js";
+import { runJob, type JobFail, type JobOutcome } from "./run-job.js";
 import { masterSystemPrompt, SPECIALTIES } from "./specialties.js";
 import type { TeamStateStore } from "./state.js";
 import type { SlackConfig } from "./slack-hitl.js";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { askHitlAndWait, slackHitlEnabled } from "./slack-hitl.js";
+import {
+  askHitlAndWait,
+  postSlackMessage,
+  slackHitlEnabled,
+  slackPostingEnabled,
+} from "./slack-hitl.js";
+import type {
+  AuthorizationMessage,
+  SteerHub,
+} from "./steer.js";
+import {
+  isUnsafeAuthorizationValue,
+  looksLikeSecret,
+  questionSha256,
+} from "./control.js";
 
-async function askStdinHitl(question: string): Promise<string> {
+type GateDecision = {
+  decision: "approve" | "deny" | "cancel" | "choice";
+  value?: string;
+  answer: string;
+  source: "control" | "slack" | "tty";
+  authorizationId?: string;
+  controlMessage?: AuthorizationMessage;
+};
+
+const MAX_HITL_GATES = 32;
+
+async function askStdinHitl(question: string): Promise<GateDecision> {
   const rl = readline.createInterface({ input, output });
   try {
     console.log(`\n\x1b[33m⏸ HITL (terminal)\x1b[0m ${question}`);
-    const answer = await rl.question("Your reply> ");
-    return answer.trim();
+    for (;;) {
+      const raw = await rl.question(
+        "Decision [approve | deny | cancel | choice:<value>]> ",
+      );
+      const parsed = parseGateDecision(raw, "tty");
+      if (parsed) return parsed;
+      console.warn(
+        "Invalid decision. Secrets and free-form text are not accepted here; use a steer for guidance.",
+      );
+    }
   } finally {
     rl.close();
   }
@@ -29,8 +62,9 @@ export type OrchestratorOptions = {
   hitlTimeoutMs?: number;
   live?: boolean;
   verbose?: boolean;
-  /** If Slack HITL off, prompt on this TTY for answers. */
   interactiveHitl?: boolean;
+  /** Signed controller and mid-run steer channel. */
+  steer?: SteerHub;
 };
 
 function buildMasterPrompt(opts: OrchestratorOptions): string {
@@ -49,14 +83,159 @@ function buildMasterPrompt(opts: OrchestratorOptions): string {
   return parts.join("\n");
 }
 
-function extractHitl(text: string): string | undefined {
-  const m = text.match(/HITL_REQUIRED:\s*(.+)/i);
-  return m?.[1]?.trim();
+export function extractHitl(text: string): string | undefined {
+  const matches = [
+    ...text.matchAll(/^HITL_REQUIRED:\s*(\S[^\r\n]*)$/gim),
+  ];
+  const question = matches.at(-1)?.[1]?.trim();
+  if (!question || question.length > 2_000) return undefined;
+  return question;
+}
+
+export function parseGateDecision(
+  raw: string,
+  source: GateDecision["source"],
+): GateDecision | undefined {
+  const answer = raw.trim();
+  if (looksLikeSecret(answer)) return undefined;
+  if (/^approve$/i.test(answer)) {
+    return { decision: "approve", answer: "approve", source };
+  }
+  const approveValue = answer.match(/^approve[-:]([A-Za-z0-9_.-]{1,128})$/i);
+  if (
+    approveValue?.[1] &&
+    !isUnsafeAuthorizationValue(approveValue[1])
+  ) {
+    return {
+      decision: "approve",
+      value: approveValue[1],
+      answer: `approve:${approveValue[1]}`,
+      source,
+    };
+  }
+  if (/^deny$/i.test(answer)) {
+    return { decision: "deny", answer: "deny", source };
+  }
+  if (/^cancel$/i.test(answer)) {
+    return { decision: "cancel", answer: "cancel", source };
+  }
+  const choice = answer.match(/^choice:([A-Za-z0-9_.-]{1,128})$/i);
+  if (choice?.[1] && !isUnsafeAuthorizationValue(choice[1])) {
+    return {
+      decision: "choice",
+      value: choice[1],
+      answer: `choice:${choice[1]}`,
+      source,
+    };
+  }
+  if (/^[1-9][0-9]{0,2}$/.test(answer)) {
+    return {
+      decision: "choice",
+      value: answer,
+      answer: `choice:${answer}`,
+      source,
+    };
+  }
+  return undefined;
+}
+
+function failedGate(
+  opts: OrchestratorOptions,
+  prior: JobOutcome,
+  jobId: string,
+  error: string,
+): JobFail {
+  opts.state?.upsert({
+    jobId,
+    role: "master",
+    status: "blocked",
+    lastError: error,
+    attempts: [...prior.attempts],
+    lastEventAt: Date.now(),
+  });
+  return {
+    ok: false,
+    role: "master",
+    attempts: [...prior.attempts],
+    lastError: error,
+    streamedText: prior.streamedText,
+  };
+}
+
+async function waitForGateDecision(
+  opts: OrchestratorOptions,
+  jobId: string,
+  question: string,
+): Promise<GateDecision> {
+  const timeoutMs = opts.hitlTimeoutMs ?? 30 * 60 * 1000;
+
+  // Signed run-scoped control is authoritative when configured. Slack is only
+  // a notification in this mode; Nir authorizes through the Codex controller.
+  if (opts.steer?.enabled) {
+    if (opts.slack && slackPostingEnabled(opts.slack)) {
+      try {
+        await postSlackMessage(
+          opts.slack,
+          [
+            `*coding-agent-team authorization required*`,
+            `run \`${opts.steer.teamRunId}\` · job \`${jobId}\``,
+            question,
+            "",
+            `question_sha256: \`${questionSha256(question)}\``,
+            "_Authorize through the signed Codex controller channel._",
+          ].join("\n"),
+        );
+      } catch (error) {
+        console.warn(
+          `[master] Slack notification failed; signed control remains active: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    }
+    const control = await opts.steer.waitForAuthorization(
+      {
+        teamRunId: opts.steer.teamRunId,
+        jobId,
+        question,
+      },
+      { timeoutMs },
+    );
+    return {
+      decision: control.decision,
+      value: control.value,
+      answer: control.answer,
+      source: "control",
+      authorizationId: control.id,
+      controlMessage: control,
+    };
+  }
+
+  if (opts.slack && slackHitlEnabled(opts.slack)) {
+    const { reply } = await askHitlAndWait(opts.slack, {
+      jobId,
+      question,
+      timeoutMs,
+      allowedReplies: "approve | deny | cancel | choice:<value>",
+      validateReply: (text) => Boolean(parseGateDecision(text, "slack")),
+    });
+    const parsed = parseGateDecision(reply.text, "slack");
+    if (!parsed) {
+      throw new Error(
+        `invalid Slack authorization from allowlisted user ${reply.user}`,
+      );
+    }
+    return parsed;
+  }
+
+  if (opts.interactiveHitl !== false && process.stdin.isTTY) {
+    return askStdinHitl(question);
+  }
+
+  throw new Error("authorization required but no signed control, Slack, or TTY");
 }
 
 /**
- * Run Opus-led master with specialty subagents. On HITL_REQUIRED, park and
- * ask Slack when configured.
+ * Run Opus-led master with specialty subagents. HITL is a hard gate: failure,
+ * timeout, deny, or cancel returns a failed outcome and can never print OK.
  */
 export async function runOrchestrator(
   opts: OrchestratorOptions,
@@ -71,9 +250,6 @@ export async function runOrchestrator(
       },
     ]),
   );
-
-  // Reviewer subagent should stay Opus-first in the definition; fallbacks
-  // for the master itself are handled by runJob's OPUS_LED_CHAIN.
   agents.reviewer = {
     ...agents.reviewer!,
     model: { id: MODELS.opus },
@@ -82,7 +258,7 @@ export async function runOrchestrator(
   const jobId = `master-${Date.now()}`;
   let prompt = buildMasterPrompt(opts);
 
-  for (let round = 0; round < 3; round++) {
+  for (let round = 0; round <= MAX_HITL_GATES; round++) {
     const outcome = await runJob({
       role: "master",
       cwd: opts.cwd,
@@ -91,46 +267,92 @@ export async function runOrchestrator(
       prompt,
       agents,
       state: opts.state,
-      jobId: round === 0 ? jobId : `${jobId}-r${round}`,
+      jobId,
       live: opts.live,
       verbose: opts.verbose,
+      steer: opts.steer,
     });
 
     if (!outcome.ok) return outcome;
-
     const question = extractHitl(outcome.streamedText);
     if (!question) return outcome;
+    if (!opts.state) {
+      return failedGate(
+        opts,
+        outcome,
+        jobId,
+        "HITL requires TeamStateStore for exact audit binding",
+      );
+    }
+    if (round === MAX_HITL_GATES) {
+      return failedGate(
+        opts,
+        outcome,
+        jobId,
+        `HITL gate limit reached (${MAX_HITL_GATES})`,
+      );
+    }
+    if (looksLikeSecret(question)) {
+      return failedGate(
+        opts,
+        outcome,
+        jobId,
+        "refusing HITL question containing a secret-shaped value",
+      );
+    }
 
     opts.state?.markAwaitingHuman(jobId, question);
-    let answer: string;
-    if (opts.slack && slackHitlEnabled(opts.slack)) {
-      console.log(`[master] awaiting Slack HITL: ${question}`);
-      ({ answer } = await askHitlAndWait(opts.slack, {
+    let authorization: GateDecision;
+    try {
+      authorization = await waitForGateDecision(opts, jobId, question);
+    } catch (error) {
+      return failedGate(
+        opts,
+        outcome,
         jobId,
-        question,
-        timeoutMs: opts.hitlTimeoutMs,
-      }));
-    } else if (opts.interactiveHitl !== false && process.stdin.isTTY) {
-      answer = await askStdinHitl(question);
-      if (!answer) {
-        console.warn("[master] empty HITL reply; stopping");
-        return outcome;
-      }
-    } else {
-      console.warn(
-        `[master] HITL_REQUIRED but no Slack/TTY: ${question}`,
+        `authorization unresolved: ${error instanceof Error ? error.message : error}`,
       );
-      return outcome;
     }
-    opts.state?.resolveHuman(jobId, answer);
+
+    try {
+      opts.state?.resolveHuman(jobId, {
+        decision: authorization.decision,
+        source: authorization.source,
+        authorizationId: authorization.authorizationId,
+      });
+      if (authorization.controlMessage) {
+        opts.steer!.acknowledgeAuthorization(authorization.controlMessage);
+      }
+    } catch (error) {
+      return failedGate(
+        opts,
+        outcome,
+        jobId,
+        `authorization audit failed: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+
+    if (
+      authorization.decision === "deny" ||
+      authorization.decision === "cancel"
+    ) {
+      return failedGate(
+        opts,
+        outcome,
+        jobId,
+        `human decision: ${authorization.decision}`,
+      );
+    }
+
     prompt = [
       buildMasterPrompt(opts),
       "",
-      "## Human reply (Slack HITL)",
+      "## Authorized gate decision",
       `Question: ${question}`,
-      `Answer: ${answer}`,
+      `Decision: ${authorization.answer}`,
+      `Source: ${authorization.source}`,
       "",
-      "Continue the task with this decision. Spawn specialties as needed.",
+      "Continue only within this authorization. Ask again at the next named gate.",
     ].join("\n");
   }
 
@@ -138,7 +360,7 @@ export async function runOrchestrator(
     ok: false,
     role: "master",
     attempts: [...ROLE_MODEL_CHAINS.master],
-    lastError: "HITL rounds exhausted",
+    lastError: "HITL gate loop exited unexpectedly",
     streamedText: "",
   };
 }

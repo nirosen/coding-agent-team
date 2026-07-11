@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "team": "tsx src/cli.ts",
-    "typecheck": "tsc --noEmit"
+    "teamctl": "tsx src/teamctl.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts"
   },
   "engines": {
     "node": ">=22.13.0"
