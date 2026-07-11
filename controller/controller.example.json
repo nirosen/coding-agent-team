@@ -1,0 +1,12 @@
+{
+  "worker_host": "cyl-mec06",
+  "team_cwd": "/images/nrosen/cursor-workspaces/agents-lab-next-task",
+  "harness_dir": "/images/nrosen/cursor-cli/teams/aisec-team-control",
+  "worker_tmux_session": "aisec-team-control",
+  "worker_control_root": "/labhome/nrosen/.coding-agent-team/control",
+  "worker_public_key_path": "/labhome/nrosen/.coding-agent-team/controller.pub",
+  "private_key_path": "~/.coding-agent-team/controller.key",
+  "public_key_path": "~/.coding-agent-team/controller.pub",
+  "minimum_free_gb": 20,
+  "require_docker": true
+}

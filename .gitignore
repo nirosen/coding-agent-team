@@ -6,6 +6,10 @@ dist/
 *.log
 .team-state/
 .DS_Store
+__pycache__/
+*.pyc
 *.pem
 *credentials*
 *secret*
+controller/controller.json
+controller/keys/
