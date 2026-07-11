@@ -1037,7 +1037,8 @@ def workspace_sha256():
   if len(head)<40 or any(ch not in b"0123456789abcdef" for ch in head):
     raise SystemExit("workspace Git HEAD is invalid")
   listed=subprocess.run(["git","ls-files","-co","--exclude-standard","-z","--","."],cwd=cwd,check=True,capture_output=True).stdout
-  paths=sorted(relative for relative in listed.split(b"\0") if relative and not any(
+  ignored=subprocess.run(["git","ls-files","-o","-i","--exclude-standard","-z","--","."],cwd=cwd,check=True,capture_output=True).stdout
+  paths=sorted(relative for relative in set((listed+ignored).split(b"\0")) if relative and not any(
     relative==prefix or relative.startswith(prefix+b"/") for prefix in (b".team-state",b".cursor")
   ))
   digest=hashlib.sha256()
@@ -1127,9 +1128,6 @@ function verifyLatestRun(
   ) {
     throw new Error("latest run still has active or orphaned processes");
   }
-  if ((state.receipts ?? []).some((receipt) => receipt.status !== "passed")) {
-    throw new Error("latest run contains failed execution receipts");
-  }
   const payload = JSON.parse(
     remotePython(
       config,
@@ -1197,8 +1195,23 @@ function verifyLatestRun(
       throw new Error(`execution receipt is not bound to a manifest command`);
     }
   }
+  const latestByCommand = new Map<
+    string,
+    (typeof state.receipts)[number]
+  >();
+  for (const receipt of state.receipts) {
+    const prior = latestByCommand.get(receipt.commandId);
+    if (
+      !prior ||
+      receipt.endedAt > prior.endedAt ||
+      (receipt.endedAt === prior.endedAt &&
+        receipt.receiptId.localeCompare(prior.receiptId) > 0)
+    ) {
+      latestByCommand.set(receipt.commandId, receipt);
+    }
+  }
   const passedCommandIds = new Set(
-    state.receipts
+    [...latestByCommand.values()]
       .filter((receipt) => receipt.status === "passed")
       .map((receipt) => receipt.commandId),
   );
@@ -1326,11 +1339,12 @@ function verifyLatestRun(
       gate.to !== transition.to ||
       gate.decision !== "approve" ||
       gate.resolvedAt === undefined ||
-      !gate.authorizationId
+      !gate.authorizationId ||
+      gate.workspaceGitHead !== binding.workspace.gitHead
     ) {
       throw new Error(`phase gate ${index + 1} is not approved`);
     }
-    const phaseReceipts = state.receipts.filter(
+    const phaseReceipts = [...latestByCommand.values()].filter(
       (receipt) =>
         receipt.phase === transition.from && receipt.status === "passed",
     );
@@ -1363,6 +1377,7 @@ function verifyLatestRun(
       commandManifestSha256: binding.commandManifestSha256,
       testManifestSha256: binding.testManifestSha256,
       workspaceSha256: gate.workspaceSha256,
+      workspaceGitHead: gate.workspaceGitHead,
       priorGateHistorySha256: artifactSha256(gates.slice(0, index)),
       testConfigSha256: Object.fromEntries(
         tests.selections

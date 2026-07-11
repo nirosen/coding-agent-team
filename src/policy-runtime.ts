@@ -316,12 +316,32 @@ export class PolicyRuntime {
     reconciliation?: SpendReconciliation;
   } {
     const snapshot = this.state.snapshot();
+    const workspaceGitHead = requireGitHead(this.workspace);
+    if (workspaceGitHead !== this.bundle.binding.workspace.gitHead) {
+      throw new Error("workspace Git HEAD changed after run authorization");
+    }
     const phaseCommands = this.commands.commands.filter(
       (command) => command.phase === transition.from,
     );
-    const passedReceipts = snapshot.receipts.filter(
-      (receipt) =>
-        receipt.phase === transition.from && receipt.status === "passed",
+    const latestByCommand = new Map<
+      string,
+      (typeof snapshot.receipts)[number]
+    >();
+    for (const receipt of snapshot.receipts.filter(
+      (candidate) => candidate.phase === transition.from,
+    )) {
+      const prior = latestByCommand.get(receipt.commandId);
+      if (
+        !prior ||
+        receipt.endedAt > prior.endedAt ||
+        (receipt.endedAt === prior.endedAt &&
+          receipt.receiptId.localeCompare(prior.receiptId) > 0)
+      ) {
+        latestByCommand.set(receipt.commandId, receipt);
+      }
+    }
+    const passedReceipts = [...latestByCommand.values()].filter(
+      (receipt) => receipt.status === "passed",
     );
     const workspaceSha256 = workspaceSnapshotSha256(this.workspace);
     for (const receipt of passedReceipts) {
@@ -449,6 +469,7 @@ export class PolicyRuntime {
         commandManifestSha256: this.bundle.binding.commandManifestSha256,
         testManifestSha256: this.bundle.binding.testManifestSha256,
         workspaceSha256,
+        workspaceGitHead,
         priorGateHistorySha256: artifactSha256(
           (snapshot.policy?.gateHistory ?? []).filter(
             (gate) => gate.resolvedAt !== undefined,
@@ -488,6 +509,7 @@ export class PolicyRuntime {
       to: transition.to,
       evidenceSha256,
       workspaceSha256: collected.evidence.workspaceSha256 as string,
+      workspaceGitHead: collected.evidence.workspaceGitHead as string,
       question,
       questionSha256: sha256(question.trim()),
       requestedAt: Date.now(),
@@ -567,8 +589,23 @@ export class PolicyRuntime {
       );
     }
     const snapshot = this.state.snapshot();
+    const latestByCommand = new Map<
+      string,
+      (typeof snapshot.receipts)[number]
+    >();
+    for (const receipt of snapshot.receipts) {
+      const prior = latestByCommand.get(receipt.commandId);
+      if (
+        !prior ||
+        receipt.endedAt > prior.endedAt ||
+        (receipt.endedAt === prior.endedAt &&
+          receipt.receiptId.localeCompare(prior.receiptId) > 0)
+      ) {
+        latestByCommand.set(receipt.commandId, receipt);
+      }
+    }
     const passedCommandIds = new Set(
-      snapshot.receipts
+      [...latestByCommand.values()]
         .filter((receipt) => receipt.status === "passed")
         .map((receipt) => receipt.commandId),
     );
@@ -581,7 +618,6 @@ export class PolicyRuntime {
       );
     }
     if (
-      snapshot.receipts.some((receipt) => receipt.status !== "passed") ||
       snapshot.policy?.gateHistory.some(
         (gate) => gate.resolvedAt !== undefined && gate.decision !== "approve",
       )

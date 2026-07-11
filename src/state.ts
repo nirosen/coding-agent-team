@@ -61,6 +61,7 @@ export type PolicyGateRecord = {
   to: string;
   evidenceSha256: string;
   workspaceSha256: string;
+  workspaceGitHead: string;
   question: string;
   questionSha256: string;
   requestedAt: number;

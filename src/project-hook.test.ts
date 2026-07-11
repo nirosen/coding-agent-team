@@ -52,6 +52,25 @@ describe("hard-policy project hook", () => {
       },
     );
     assert.equal(JSON.parse(editOutput).permission, "deny");
+    const stateAlias = path.join(workspace, "control-alias");
+    fs.symlinkSync(".team-state", stateAlias);
+    const aliasOutput = execFileSync(
+      process.execPath,
+      [
+        path.join(root, "scripts", "protect-policy-files.mjs"),
+        workspace,
+      ],
+      {
+        input: JSON.stringify({
+          hook_event_name: "preToolUse",
+          tool_name: "Write",
+          tool_input: { path: path.join(stateAlias, "forged.json") },
+        }),
+        encoding: "utf8",
+      },
+    );
+    assert.equal(JSON.parse(aliasOutput).permission, "deny");
+    fs.unlinkSync(stateAlias);
     const mcpPath = path.join(workspace, ".cursor", "mcp.json");
     fs.writeFileSync(mcpPath, '{"mcpServers":{}}\n');
     assert.throws(() => lease.verify(), /MCP\/plugin settings/);

@@ -34,8 +34,8 @@ export function requireGitHead(cwd: string): string {
 
 /**
  * Hash the visible working tree without mutating the index. Harness-owned
- * `.team-state` and temporary `.cursor` policy files are excluded. Ignored
- * files are omitted unless separately pinned by a manifest.
+ * `.team-state`, temporary `.cursor` policy files, and Git internals are the
+ * only exclusions. Ignored files are included because tests may consume them.
  */
 export function workspaceSnapshotSha256(cwd: string): string {
   const workspace = fs.realpathSync(cwd);
@@ -44,10 +44,18 @@ export function workspaceSnapshotSha256(cwd: string): string {
     workspace,
     ["ls-files", "-co", "--exclude-standard", "-z", "--", "."],
   ) as Buffer;
-  const relativePaths = listed
-    .toString("utf8")
-    .split("\0")
-    .filter(Boolean)
+  const ignored = gitOutput(
+    workspace,
+    ["ls-files", "-o", "-i", "--exclude-standard", "-z", "--", "."],
+  ) as Buffer;
+  const relativePaths = [
+    ...new Set(
+      Buffer.concat([listed, ignored])
+        .toString("utf8")
+        .split("\0")
+        .filter(Boolean),
+    ),
+  ]
     .filter(
       (relative) =>
         !EXCLUDED_PREFIXES.some(

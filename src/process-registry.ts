@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import type {
   SDKCustomTool,
   SDKCustomToolContext,
@@ -287,6 +287,13 @@ function validateNoDetach(command: ManifestCommand): void {
       throw new Error(`${base} detached/restart execution is forbidden`);
     }
   }
+  const encodedArguments = command.argv.slice(1).join("\n").toLowerCase();
+  if (
+    /\b(?:setsid|daemonize|start_new_session)\b/.test(encodedArguments) ||
+    /\bdetached\s*[:=]\s*true\b/.test(encodedArguments)
+  ) {
+    throw new Error("manifest arguments contain a detachment primitive");
+  }
 }
 
 function safeWorkspaceCwd(workspace: string, relative: string): string {
@@ -326,6 +333,8 @@ export class ProcessRegistry {
   private readonly onReceipt: (receipt: ExecutionReceipt) => void;
   private readonly launcherPath: string;
   private readonly launcherSha256: string;
+  private readonly namespacePath: string;
+  private readonly namespaceSha256: string;
   private readonly tracked = new Map<string, Tracked>();
   private readonly fatalErrors: Error[] = [];
   private shuttingDown = false;
@@ -353,6 +362,33 @@ export class ProcessRegistry {
       throw new Error("supervised launcher must be a regular non-symlink file");
     }
     this.launcherSha256 = executableDigest(this.launcherPath);
+    this.namespacePath = resolveExecutable("unshare", process.env.PATH);
+    this.namespaceSha256 = executableDigest(this.namespacePath);
+    const namespaceProbe = spawnSync(
+      this.namespacePath,
+      [
+        "--user",
+        "--map-current-user",
+        "--pid",
+        "--fork",
+        "--kill-child=SIGKILL",
+        "--mount-proc",
+        process.execPath,
+        "-e",
+        "if(process.pid!==1)process.exit(1)",
+      ],
+      {
+        cwd: this.workspace,
+        timeout: 10_000,
+        stdio: "ignore",
+      },
+    );
+    if (namespaceProbe.error || namespaceProbe.status !== 0) {
+      throw new Error(
+        "hard supervised execution requires unprivileged Linux PID namespaces",
+        { cause: namespaceProbe.error },
+      );
+    }
   }
 
   customTool(ownerJobId: string): SDKCustomTool {
@@ -453,6 +489,9 @@ export class ProcessRegistry {
     if (executableDigest(this.launcherPath) !== this.launcherSha256) {
       throw new Error("trusted supervised launcher changed");
     }
+    if (executableDigest(this.namespacePath) !== this.namespaceSha256) {
+      throw new Error("trusted PID namespace launcher changed");
+    }
     const cwd = safeWorkspaceCwd(this.workspace, command.cwd);
     const executable = resolveExecutable(command.argv[0]!, process.env.PATH);
     const actualExecutableSha256 = executableDigest(executable);
@@ -489,13 +528,27 @@ export class ProcessRegistry {
       JSON.stringify({ argv: [executable, ...command.argv.slice(1)], cwd }),
       "utf8",
     ).toString("base64url");
-    const child = spawn(process.execPath, [this.launcherPath, payload], {
-      cwd: this.workspace,
-      env,
-      detached: true,
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const child = spawn(
+      this.namespacePath,
+      [
+        "--user",
+        "--map-current-user",
+        "--pid",
+        "--fork",
+        "--kill-child=SIGKILL",
+        "--mount-proc",
+        process.execPath,
+        this.launcherPath,
+        payload,
+      ],
+      {
+        cwd: this.workspace,
+        env,
+        detached: true,
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
     if (!child.pid) {
       fs.closeSync(logFd);
       throw new Error(`could not launch command ${commandId}`);

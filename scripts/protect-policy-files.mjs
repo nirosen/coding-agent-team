@@ -1,7 +1,10 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import path from "node:path";
 
-const workspace = process.argv[2] ? path.resolve(process.argv[2]) : null;
+const workspace = process.argv[2]
+  ? fs.realpathSync(path.resolve(process.argv[2]))
+  : null;
 const deny = (message) => {
   process.stdout.write(
     JSON.stringify({
@@ -33,6 +36,21 @@ if (!workspace) {
 
 const protectedCursor = path.join(workspace, ".cursor");
 const protectedState = path.join(workspace, ".team-state");
+const resolveExistingAliases = (candidate) => {
+  const suffix = [];
+  let probe = candidate;
+  for (;;) {
+    try {
+      return path.resolve(fs.realpathSync(probe), ...suffix);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      const parent = path.dirname(probe);
+      if (parent === probe) throw error;
+      suffix.unshift(path.basename(probe));
+      probe = parent;
+    }
+  }
+};
 const strings = [];
 const visit = (value) => {
   if (typeof value === "string") strings.push(value);
@@ -52,15 +70,24 @@ const targetsProtectedPath = strings.some((value) => {
   ) {
     return true;
   }
-  const candidate = path.isAbsolute(value)
-    ? path.resolve(value)
-    : path.resolve(workspace, value);
-  return (
-    candidate === protectedCursor ||
-    candidate.startsWith(`${protectedCursor}${path.sep}`) ||
-    candidate === protectedState ||
-    candidate.startsWith(`${protectedState}${path.sep}`)
-  );
+  try {
+    const candidate = path.isAbsolute(value)
+      ? path.resolve(value)
+      : path.resolve(workspace, value);
+    const dereferenced = resolveExistingAliases(candidate);
+    return (
+      candidate === protectedCursor ||
+      candidate.startsWith(`${protectedCursor}${path.sep}`) ||
+      candidate === protectedState ||
+      candidate.startsWith(`${protectedState}${path.sep}`) ||
+      dereferenced === protectedCursor ||
+      dereferenced.startsWith(`${protectedCursor}${path.sep}`) ||
+      dereferenced === protectedState ||
+      dereferenced.startsWith(`${protectedState}${path.sep}`)
+    );
+  } catch {
+    return true;
+  }
 });
 
 if (targetsProtectedPath) {

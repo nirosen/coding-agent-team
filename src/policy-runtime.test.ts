@@ -65,7 +65,7 @@ describe("policy phase gates and readiness", () => {
     );
     fs.writeFileSync(
       path.join(workspace, ".gitignore"),
-      ".team-state/\n.cursor/\n",
+      ".team-state/\n.cursor/\nignored-input\n",
     );
     execFileSync("git", ["init", "-q"], { cwd: workspace });
     execFileSync("git", ["add", "."], { cwd: workspace });
@@ -82,6 +82,8 @@ describe("policy phase gates and readiness", () => {
       ],
       { cwd: workspace },
     );
+    const ignoredInput = path.join(workspace, "ignored-input");
+    fs.writeFileSync(ignoredInput, "original\n");
     const gitHead = requireGitHead(workspace);
     const profile: PolicyProfile = {
       schema: POLICY_PROFILE_SCHEMA,
@@ -212,6 +214,23 @@ describe("policy phase gates and readiness", () => {
     for (const command of commands.commands) {
       state.recordReceipt({
         schema: "coding-agent-team-execution-receipt/v1",
+        receiptId: `receipt-stale-${command.id}`,
+        processId: `process-stale-${command.id}`,
+        ownerJobId: "master-1",
+        commandId: command.id,
+        commandSha256: commandDigest(command),
+        workspaceSha256: "0".repeat(64),
+        phase: command.phase,
+        kind: command.kind,
+        startedAt: now - 2,
+        endedAt: now - 1,
+        exitCode: 1,
+        signal: null,
+        expectedExit: false,
+        status: "failed",
+      });
+      state.recordReceipt({
+        schema: "coding-agent-team-execution-receipt/v1",
         receiptId: `receipt-${command.id}`,
         processId: `process-${command.id}`,
         ownerJobId: "master-1",
@@ -245,7 +264,7 @@ describe("policy phase gates and readiness", () => {
       },
       keys.privateKeyPem,
     );
-    fs.writeFileSync(ledger, "changed while awaiting authorization\n");
+    fs.writeFileSync(ignoredInput, "changed while awaiting authorization\n");
     assert.throws(
       () =>
         runtime.authorizePending({
@@ -255,7 +274,7 @@ describe("policy phase gates and readiness", () => {
         }),
       /evidence changed|workspace changed/,
     );
-    fs.writeFileSync(ledger, "");
+    fs.writeFileSync(ignoredInput, "original\n");
     runtime.authorizePending({
       decision: "approve",
       authorizationId: authorization.id,

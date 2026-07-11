@@ -64,7 +64,9 @@ Set `require_policy_bundle` in `controller.json` to reject legacy task-file
 starts. Test the full flow first with a disposable no-spend bundle.
 
 The hard-policy hook denies the SDK’s built-in Shell; only exact manifest
-commands can run through the harness supervisor. This does not independently
-measure provider billing or contain an executable that deliberately escapes
-its process group, so adapters must use authoritative receipts and the worker
-must remain least-privileged.
+commands can run through the harness supervisor. Local descendants are
+contained in an unprivileged PID namespace, so the Linux worker must support
+`unshare --user --map-current-user --pid`. This does not independently measure
+provider billing or revoke external resources created through a Docker socket,
+remote API, or similar daemon, so adapters must use authoritative receipts and
+the worker must remain least-privileged.

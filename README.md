@@ -86,7 +86,8 @@ Local SDK runs appear in this terminal, not Cursor’s cloud Agents Window.
 ## Signed hard-policy run
 
 Hard-policy mode is opt-in through a controller-signed bundle and currently
-requires a dedicated Linux worktree. The unsigned controller-side directory
+requires a dedicated Linux worktree with unprivileged user/PID namespaces. The
+unsigned controller-side directory
 contains `task.md`, `profile.json`, `commands.json`, `tests.json`, and
 `accounting.json`. `teamctl start <bundle-directory>` validates those files,
 binds them to the worker’s real path and Git HEAD, adds a signed `binding.json`,
@@ -103,12 +104,15 @@ During the run:
 
 - a temporary fail-closed project hook denies every built-in Shell call and
   edits to `.cursor/hooks.json` or `.team-state`;
-- `supervised_process` accepts command IDs only from the signed manifest and
-  uses exact argv without a shell;
+- `supervised_process` accepts command IDs only from the signed manifest, uses
+  exact argv without a shell, and contains local descendants in a per-command
+  PID namespace;
 - the harness refuses job/run completion while registered work is active;
 - every phase transition rechecks receipts, frozen test selection, process
   idleness, source hashes, canonical spend events, watermarks, limits, and a
-  Git-backed working-tree digest; test/review receipts become stale after edits;
+  Git-backed working-tree digest (including ignored files); test/review
+  receipts become stale after edits, while a successful rerun supersedes an
+  older failed/stale attempt;
 - the exact evidence digest is included in the signed authorization question;
 - only an exact signed final approval can produce the write-once readiness
   seal, and no further model turn runs after that seal.
