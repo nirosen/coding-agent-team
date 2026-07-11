@@ -355,8 +355,14 @@ async function stage(): Promise<void> {
     "#!/bin/sh\nexit 1\n",
     { mode: 0o755 },
   );
-  const privateKeyPath = path.join(root, "controller.key");
-  const publicKeyPath = path.join(root, "controller.pub");
+  const controllerHome = path.join(root, "controller-home");
+  const controllerKeyDirectory = path.join(
+    controllerHome,
+    ".coding-agent-team",
+  );
+  fs.mkdirSync(controllerKeyDirectory, { recursive: true, mode: 0o700 });
+  const privateKeyPath = path.join(controllerKeyDirectory, "controller.key");
+  const publicKeyPath = path.join(controllerKeyDirectory, "controller.pub");
   fs.writeFileSync(privateKeyPath, keys.privateKeyPem, { mode: 0o600 });
   fs.writeFileSync(publicKeyPath, keys.publicKeyPem, { mode: 0o600 });
   const configPath = path.join(root, "controller.json");
@@ -395,6 +401,7 @@ async function stage(): Promise<void> {
       encoding: "utf8",
       env: {
         ...process.env,
+        HOME: controllerHome,
         PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
       },
     },
